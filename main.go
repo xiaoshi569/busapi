@@ -328,8 +328,17 @@ func (p *AccountPool) refreshWorker(id int) {
 		}
 		acc.JWTExpires = time.Time{}
 		if err := acc.RefreshJWT(); err != nil {
-			log.Printf("❌ [worker-%d] [%s] 刷新失败: %v", id, acc.Data.Email, err)
-			p.RemoveAccount(acc)
+			// 只有账号失效（401/403）才删除，其他错误放回队列重试
+			if strings.Contains(err.Error(), "账号失效") {
+				log.Printf("❌ [worker-%d] [%s] %v", id, acc.Data.Email, err)
+				p.RemoveAccount(acc)
+			} else if strings.Contains(err.Error(), "刷新冷却中") {
+				// 冷却中，直接放回 ready 队列，等待下次刷新周期
+				p.MarkReady(acc)
+			} else {
+				log.Printf("⚠️ [worker-%d] [%s] 刷新失败: %v，稍后重试", id, acc.Data.Email, err)
+				p.MarkPending(acc)
+			}
 		} else {
 			// 写回文件
 			if err := acc.SaveToFile(); err != nil {
@@ -354,7 +363,7 @@ func (p *AccountPool) scanWorker() {
 			p.Load(DataDir)
 			// 将所有 ready 账号移回 pending 重新刷新
 			p.RefreshAllAccounts()
-			
+
 		}
 	}
 }
@@ -444,8 +453,20 @@ func (p *AccountPool) Next() *Account {
 		return nil
 	}
 
-	idx := atomic.AddUint64(&p.index, 1) - 1
-	return p.readyAccounts[idx%uint64(len(p.readyAccounts))]
+	// 尝试找一个不在冷却中的账号
+	n := len(p.readyAccounts)
+	startIdx := atomic.AddUint64(&p.index, 1) - 1
+	for i := 0; i < n; i++ {
+		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
+		acc.mu.Lock()
+		inCooldown := time.Since(acc.LastRefresh) < refreshCooldown
+		acc.mu.Unlock()
+		if !inCooldown {
+			return acc
+		}
+	}
+	// 所有账号都在冷却中，返回第一个（等待冷却结束）
+	return p.readyAccounts[startIdx%uint64(n)]
 }
 
 func (p *AccountPool) Count() int {
@@ -522,7 +543,7 @@ func newHTTPClient() *http.Client {
 
 	return &http.Client{
 		Transport: transport,
-		Timeout:   1800 * time.Second, 
+		Timeout:   1800 * time.Second,
 	}
 }
 
@@ -639,6 +660,11 @@ func (acc *Account) RefreshJWT() error {
 
 	if resp.StatusCode != 200 {
 		body, _ := readResponseBody(resp)
+		// 401/403 表示账号失效，需要删除
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return fmt.Errorf("账号失效: %d %s", resp.StatusCode, string(body))
+		}
+		// 其他状态码可能是临时问题
 		return fmt.Errorf("getoxsrf 失败: %d %s", resp.StatusCode, string(body))
 	}
 
@@ -1342,6 +1368,13 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			resp.Body.Close()
 			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			// 429 限流，标记账号进入冷却，下次 Next() 会自动切换到其他账号
+			if resp.StatusCode == 429 {
+				acc.mu.Lock()
+				acc.LastRefresh = time.Now() // 触发冷却
+				acc.mu.Unlock()
+				log.Printf("⏳ [%s] 429 限流，账号进入冷却", acc.Data.Email)
+			}
 			continue
 		}
 
@@ -1355,6 +1388,15 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			acc.InvalidateJWT()
 			pool.MarkPending(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
+			continue
+		}
+
+		// 检查是否有实际内容（非空返回）
+		hasContent := bytes.Contains(respBody, []byte(`"text"`)) || bytes.Contains(respBody, []byte(`"file"`)) || bytes.Contains(respBody, []byte(`"inlineData"`))
+		if !hasContent && bytes.Contains(respBody, []byte(`"thought"`)) {
+			// 只有思考内容，没有实际输出，重试
+			log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
+			lastErr = fmt.Errorf("空返回，只有思考内容")
 			continue
 		}
 
@@ -1416,15 +1458,32 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	// 检查是否有有效响应
 	if len(dataList) > 0 {
 		hasValidResponse := false
+		hasFileContent := false
 		for _, data := range dataList {
-			if _, ok := data["streamAssistResponse"]; ok {
+			if streamResp, ok := data["streamAssistResponse"].(map[string]interface{}); ok {
 				hasValidResponse = true
-				break
+				// 检查是否有文件内容
+				if answer, ok := streamResp["answer"].(map[string]interface{}); ok {
+					if replies, ok := answer["replies"].([]interface{}); ok {
+						for _, reply := range replies {
+							if replyMap, ok := reply.(map[string]interface{}); ok {
+								if gc, ok := replyMap["groundedContent"].(map[string]interface{}); ok {
+									if content, ok := gc["content"].(map[string]interface{}); ok {
+										if _, ok := content["file"]; ok {
+											hasFileContent = true
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 		if !hasValidResponse {
 			log.Printf("⚠️ 响应中没有 streamAssistResponse，响应内容: %v", dataList[0])
 		}
+		log.Printf("📊 响应统计: %d 个数据块, 有效响应=%v, 包含文件=%v", len(dataList), hasValidResponse, hasFileContent)
 	}
 
 	// 从响应中提取 session（用于下载图片）
@@ -1581,6 +1640,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 非流式响应：统一处理
 		var fullContent strings.Builder
 		var fullReasoning strings.Builder
+		replyCount := 0
+		hasFile := false
 
 		for _, data := range dataList {
 			streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
@@ -1601,6 +1662,16 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				if !ok {
 					continue
 				}
+				replyCount++
+
+				// 检查是否有 file 字段
+				if gc, ok := replyMap["groundedContent"].(map[string]interface{}); ok {
+					if content, ok := gc["content"].(map[string]interface{}); ok {
+						if _, ok := content["file"]; ok {
+							hasFile = true
+						}
+					}
+				}
 
 				text, imageData, imageMime, reasoning := extractContentFromReply(replyMap, usedJWT, respSession, usedConfigID, usedOrigAuth)
 
@@ -1615,6 +1686,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				}
 			}
 		}
+
+		// 调试日志
+		log.Printf("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d",
+			replyCount, hasFile, fullContent.Len(), fullReasoning.Len())
 
 		// 构建响应消息
 		message := gin.H{

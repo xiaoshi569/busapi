@@ -9,6 +9,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	_ "golang.org/x/image/webp"
 )
 
 // ==================== 配置结构 ====================
@@ -54,7 +57,7 @@ var appConfig = AppConfig{
 		CheckIntervalMinutes: 30,
 		RegisterThreads:      1,
 		RegisterHeadless:     true,
-		RegisterScript:       "../main.js",
+		RegisterScript:       "./main.js",
 		RefreshOnStartup:     true,
 	},
 }
@@ -68,6 +71,15 @@ var (
 	JwtTTL        = 270 * time.Second
 )
 
+// 保存默认配置到文件
+func saveDefaultConfig(configPath string) error {
+	data, err := json.MarshalIndent(appConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0644)
+}
+
 func loadAppConfig() {
 	// 尝试加载配置文件
 	configPath := "config.json"
@@ -76,6 +88,12 @@ func loadAppConfig() {
 			log.Printf("⚠️ 解析配置文件失败: %v，使用默认配置", err)
 		} else {
 			log.Printf("✅ 加载配置文件: %s", configPath)
+		}
+	} else if os.IsNotExist(err) {
+		// 配置文件不存在，创建默认配置
+		log.Printf("⚠️ 配置文件不存在，创建默认配置: %s", configPath)
+		if err := saveDefaultConfig(configPath); err != nil {
+			log.Printf("❌ 创建默认配置失败: %v", err)
 		}
 	}
 
@@ -1166,16 +1184,26 @@ func parseMessageContent(msg Message) (string, []ImageInfo) {
 							parts := strings.SplitN(urlStr, ",", 2)
 							if len(parts) == 2 {
 								mimeType := "image/jpeg"
+								base64Data := parts[1]
 								if strings.Contains(parts[0], "image/png") {
 									mimeType = "image/png"
 								} else if strings.Contains(parts[0], "image/gif") {
 									mimeType = "image/gif"
 								} else if strings.Contains(parts[0], "image/webp") {
-									mimeType = "image/webp"
+									// webp 需要转换为 PNG
+									converted, err := convertBase64ToPNG(base64Data)
+									if err != nil {
+										log.Printf("⚠️ webp base64 转换失败: %v", err)
+										mimeType = "image/webp" // 回退，可能会失败
+									} else {
+										log.Printf("✅ webp base64 已转换为 PNG")
+										base64Data = converted
+										mimeType = "image/png"
+									}
 								}
 								images = append(images, ImageInfo{
 									MimeType: mimeType,
-									Data:     parts[1],
+									Data:     base64Data,
 									IsURL:    false,
 								})
 							}
@@ -1212,7 +1240,48 @@ func downloadImage(urlStr string) (string, string, error) {
 		mimeType = "image/jpeg"
 	}
 
+	// 转换不支持的格式（webp）为 PNG
+	if strings.Contains(mimeType, "webp") {
+		converted, err := convertToPNG(data)
+		if err != nil {
+			log.Printf("⚠️ webp 转换失败: %v，尝试原格式", err)
+		} else {
+			log.Printf("✅ webp 已转换为 PNG")
+			return base64.StdEncoding.EncodeToString(converted), "image/png", nil
+		}
+	}
+
 	return base64.StdEncoding.EncodeToString(data), mimeType, nil
+}
+
+// convertToPNG 将图片转换为 PNG 格式
+func convertToPNG(data []byte) ([]byte, error) {
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("解码图片失败: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, fmt.Errorf("编码 PNG 失败: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// convertBase64ToPNG 将 base64 图片转换为 PNG
+func convertBase64ToPNG(base64Data string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return "", fmt.Errorf("解码 base64 失败: %w", err)
+	}
+
+	converted, err := convertToPNG(data)
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(converted), nil
 }
 
 const maxRetries = 3
@@ -1916,6 +1985,7 @@ func main() {
 			"target":         appConfig.Pool.TargetCount,
 			"min":            appConfig.Pool.MinCount,
 			"is_registering": atomic.LoadInt32(&isRegistering) == 1,
+			"register_stats": registerStats.Get(),
 		})
 	})
 

@@ -23,6 +23,7 @@ npm-debug.log*
 *.swo
 
 # OS
+*.zip
 .DS_Store
 Thumbs.db
 
@@ -31,3 +32,4 @@ dist/
 build/
 data/
 config.json
+package-lock.json

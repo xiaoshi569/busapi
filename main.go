@@ -2,10 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
-	"crypto/hmac"
-	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,7 +12,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,625 +151,8 @@ func getEnv(key, def string) string {
 	return def
 }
 
-// ==================== 数据结构 ====================
-
-type Cookie struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Domain string `json:"domain"`
-}
-
-type AccountData struct {
-	Email         string   `json:"email"`
-	FullName      string   `json:"fullName"`
-	Authorization string   `json:"authorization"`
-	Cookies       []Cookie `json:"cookies"`
-	Timestamp     string   `json:"timestamp"`
-	ConfigID      string   `json:"configId,omitempty"` // 从 URL /cid/xxx 提取
-	CSESIDX       string   `json:"csesidx,omitempty"`  // 从 URL ?csesidx=xxx 提取
-}
-
-type Account struct {
-	Data        AccountData
-	FilePath    string
-	JWT         string
-	JWTExpires  time.Time
-	ConfigID    string
-	CSESIDX     string
-	LastRefresh time.Time // 上次刷新时间，用于冷却
-	Refreshed   bool      // 是否已刷新成功
-
-	mu sync.Mutex
-}
-
-const refreshCooldown = 4 * time.Minute // 刷新冷却时间（需小于 JwtTTL）
-
-// ==================== 号池管理 ====================
-
-type AccountPool struct {
-	readyAccounts   []*Account // 已刷新可用的账号
-	pendingAccounts []*Account // 待刷新的账号
-	index           uint64
-	mu              sync.RWMutex
-	refreshInterval time.Duration // 刷新间隔
-	refreshWorkers  int           // 刷新并发数
-	stopChan        chan struct{}
-}
-
-var pool = &AccountPool{
-	refreshInterval: 5 * time.Minute, // 5分钟刷新一次全部账号
-	refreshWorkers:  5,               // 提高并发数
-	stopChan:        make(chan struct{}),
-}
-
-func (p *AccountPool) Load(dir string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
-	if err != nil {
-		return err
-	}
-	existingAccounts := make(map[string]*Account)
-	for _, acc := range p.readyAccounts {
-		existingAccounts[acc.FilePath] = acc
-	}
-	for _, acc := range p.pendingAccounts {
-		existingAccounts[acc.FilePath] = acc
-	}
-	var newReadyAccounts []*Account
-	var newPendingAccounts []*Account
-
-	for _, f := range files {
-		// 如果账号已存在，保留在原来的池中
-		if acc, ok := existingAccounts[f]; ok {
-			if acc.Refreshed {
-				newReadyAccounts = append(newReadyAccounts, acc)
-			} else {
-				newPendingAccounts = append(newPendingAccounts, acc)
-			}
-			delete(existingAccounts, f)
-			continue
-		}
-
-		// 新账号，加入 pending 池
-		data, err := os.ReadFile(f)
-		if err != nil {
-			log.Printf("⚠️ 读取 %s 失败: %v", f, err)
-			continue
-		}
-
-		var acc AccountData
-		if err := json.Unmarshal(data, &acc); err != nil {
-			log.Printf("⚠️ 解析 %s 失败: %v", f, err)
-			continue
-		}
-
-		csesidx := acc.CSESIDX
-		if csesidx == "" {
-			csesidx = extractCSESIDX(acc.Authorization)
-		}
-		if csesidx == "" {
-			log.Printf("⚠️ %s 无法获取 csesidx", f)
-			continue
-		}
-
-		configID := acc.ConfigID
-		if configID == "" && DefaultConfig != "" {
-			configID = DefaultConfig
-		}
-
-		newPendingAccounts = append(newPendingAccounts, &Account{
-			Data:      acc,
-			FilePath:  f,
-			CSESIDX:   csesidx,
-			ConfigID:  configID,
-			Refreshed: false,
-		})
-	}
-
-	p.readyAccounts = newReadyAccounts
-	p.pendingAccounts = newPendingAccounts
-	return nil
-}
-
-// GetPendingAccount 获取一个待刷新的账号
-func (p *AccountPool) GetPendingAccount() *Account {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if len(p.pendingAccounts) == 0 {
-		return nil
-	}
-
-	acc := p.pendingAccounts[0]
-	p.pendingAccounts = p.pendingAccounts[1:]
-	return acc
-}
-func (p *AccountPool) MarkReady(acc *Account) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	acc.Refreshed = true
-	p.readyAccounts = append(p.readyAccounts, acc)
-}
-func (p *AccountPool) MarkPending(acc *Account) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i, a := range p.readyAccounts {
-		if a == acc {
-			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
-			break
-		}
-	}
-
-	// 标记需要刷新，保留 JWT（刷新时会覆盖）
-	acc.mu.Lock()
-	acc.Refreshed = false
-	acc.mu.Unlock()
-
-	// 加入 pending 池
-	p.pendingAccounts = append(p.pendingAccounts, acc)
-	log.Printf("🔄 账号 %s 移至刷新池", filepath.Base(acc.FilePath))
-}
-
-func (p *AccountPool) RemoveAccount(acc *Account) {
-	if err := os.Remove(acc.FilePath); err != nil {
-		log.Printf("⚠️ 删除文件失败 %s: %v", acc.FilePath, err)
-	} else {
-		log.Printf("🗑️ 已删除失效账号: %s", filepath.Base(acc.FilePath))
-	}
-}
-
-func (acc *Account) SaveToFile() error {
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
-
-	// 更新时间戳
-	acc.Data.Timestamp = time.Now().Format(time.RFC3339)
-
-	data, err := json.MarshalIndent(acc.Data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("序列化账号数据失败: %w", err)
-	}
-
-	if err := os.WriteFile(acc.FilePath, data, 0644); err != nil {
-		return fmt.Errorf("写入文件失败: %w", err)
-	}
-
-	return nil
-}
-func (p *AccountPool) StartPoolManager() {
-	// 启动多个刷新 worker
-	for i := 0; i < p.refreshWorkers; i++ {
-		go p.refreshWorker(i)
-	}
-
-	// 周期性重新扫描文件
-	go p.scanWorker()
-}
-
-// refreshWorker 刷新工作协程
-func (p *AccountPool) refreshWorker(id int) {
-	for {
-		select {
-		case <-p.stopChan:
-			return
-		default:
-		}
-
-		acc := p.GetPendingAccount()
-		if acc == nil {
-			// 没有待刷新账号，等待一段时间
-			time.Sleep(time.Second)
-			continue
-		}
-
-		// 检查冷却，避免频繁刷新
-		if time.Since(acc.LastRefresh) < refreshCooldown {
-			// 冷却中，直接放回 ready 队列
-			acc.Refreshed = true
-			p.MarkReady(acc)
-			continue
-		}
-
-		acc.JWTExpires = time.Time{}
-		if err := acc.RefreshJWT(); err != nil {
-			if strings.Contains(err.Error(), "账号失效") {
-				log.Printf("❌ [worker-%d] [%s] %v", id, acc.Data.Email, err)
-				p.RemoveAccount(acc)
-			} else if strings.Contains(err.Error(), "刷新冷却中") {
-				// 冷却中，直接放回 ready 队列
-				acc.Refreshed = true
-				p.MarkReady(acc)
-			} else {
-				log.Printf("⚠️ [worker-%d] [%s] 刷新失败: %v，稍后重试", id, acc.Data.Email, err)
-				p.MarkPending(acc)
-			}
-		} else {
-			// 写回文件
-			if err := acc.SaveToFile(); err != nil {
-				log.Printf("⚠️ [%s] 写回文件失败: %v", acc.Data.Email, err)
-			}
-			p.MarkReady(acc)
-		}
-	}
-}
-
-// scanWorker 周期性扫描新账号文件并刷新所有账号
-func (p *AccountPool) scanWorker() {
-	ticker := time.NewTicker(p.refreshInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.stopChan:
-			return
-		case <-ticker.C:
-			// 扫描新账号文件
-			p.Load(DataDir)
-			// 将所有 ready 账号移回 pending 重新刷新
-			p.RefreshAllAccounts()
-
-		}
-	}
-}
-func (p *AccountPool) RefreshAllAccounts() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	var stillReady []*Account
-	refreshed := 0
-	skipped := 0
-
-	for _, acc := range p.readyAccounts {
-		// 检查是否在冷却中
-		if time.Since(acc.LastRefresh) < refreshCooldown {
-			// 冷却中，保留在 ready 队列
-			stillReady = append(stillReady, acc)
-			skipped++
-			continue
-		}
-
-		// 未冷却，移入 pending 队列刷新
-		acc.Refreshed = false
-		acc.JWTExpires = time.Time{}
-		p.pendingAccounts = append(p.pendingAccounts, acc)
-		refreshed++
-	}
-
-	p.readyAccounts = stillReady
-
-	if refreshed > 0 || skipped > 0 {
-		log.Printf("🔄 周期刷新: %d 个账号加入刷新队列, %d 个账号冷却中跳过", refreshed, skipped)
-	}
-}
-func (p *AccountPool) PendingCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.pendingAccounts)
-}
-
-// ReadyCount 返回可用账号数
-func (p *AccountPool) ReadyCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.readyAccounts)
-}
-
-func extractCSESIDX(auth string) string {
-	// Bearer eyJ...
-	parts := strings.Split(auth, " ")
-	if len(parts) != 2 {
-		return ""
-	}
-	token := parts[1]
-	jwtParts := strings.Split(token, ".")
-	if len(jwtParts) != 3 {
-		return ""
-	}
-
-	payload, err := base64.RawURLEncoding.DecodeString(jwtParts[1])
-	if err != nil {
-		return ""
-	}
-
-	var claims struct {
-		Sub string `json:"sub"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return ""
-	}
-
-	// sub: "csesidx/394868671"
-	if strings.HasPrefix(claims.Sub, "csesidx/") {
-		return strings.TrimPrefix(claims.Sub, "csesidx/")
-	}
-	return ""
-}
-
-func (p *AccountPool) Next() *Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.readyAccounts) == 0 {
-		return nil
-	}
-
-	// 尝试找一个不在冷却中的账号
-	n := len(p.readyAccounts)
-	startIdx := atomic.AddUint64(&p.index, 1) - 1
-	for i := 0; i < n; i++ {
-		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
-		acc.mu.Lock()
-		inCooldown := time.Since(acc.LastRefresh) < refreshCooldown
-		acc.mu.Unlock()
-		if !inCooldown {
-			return acc
-		}
-	}
-	// 所有账号都在冷却中，返回第一个（等待冷却结束）
-	return p.readyAccounts[startIdx%uint64(n)]
-}
-
-func (p *AccountPool) Count() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.readyAccounts)
-}
-
-func (p *AccountPool) TotalCount() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return len(p.readyAccounts) + len(p.pendingAccounts)
-}
-
-// ==================== JWT 生成 ====================
-
-func urlsafeB64Encode(data []byte) string {
-	return strings.TrimRight(base64.URLEncoding.EncodeToString(data), "=")
-}
-
-func kqEncode(s string) string {
-	var b []byte
-	for _, ch := range s {
-		v := int(ch)
-		if v > 255 {
-			b = append(b, byte(v&255), byte(v>>8))
-		} else {
-			b = append(b, byte(v))
-		}
-	}
-	return urlsafeB64Encode(b)
-}
-
-func createJWT(keyBytes []byte, keyID, csesidx string) string {
-	now := time.Now().Unix()
-	header := map[string]interface{}{
-		"alg": "HS256",
-		"typ": "JWT",
-		"kid": keyID,
-	}
-	payload := map[string]interface{}{
-		"iss": "https://business.gemini.google",
-		"aud": "https://biz-discoveryengine.googleapis.com",
-		"sub": fmt.Sprintf("csesidx/%s", csesidx),
-		"iat": now,
-		"exp": now + 300,
-		"nbf": now,
-	}
-
-	headerJSON, _ := json.Marshal(header)
-	payloadJSON, _ := json.Marshal(payload)
-
-	headerB64 := kqEncode(string(headerJSON))
-	payloadB64 := kqEncode(string(payloadJSON))
-	message := headerB64 + "." + payloadB64
-
-	h := hmac.New(sha256.New, keyBytes)
-	h.Write([]byte(message))
-	sig := h.Sum(nil)
-
-	return message + "." + urlsafeB64Encode(sig)
-}
-func newHTTPClient() *http.Client {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	if Proxy != "" {
-		proxyURL, err := url.Parse(Proxy)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		}
-	}
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   1800 * time.Second,
-	}
-}
-
-var httpClient *http.Client
-
-func initHTTPClient() {
-	httpClient = newHTTPClient()
-	if Proxy != "" {
-		log.Printf("✅ 使用代理: %s", Proxy)
-	}
-}
-
-// 读取响应体，自动处理 gzip
-func readResponseBody(resp *http.Response) ([]byte, error) {
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		defer gzReader.Close()
-		reader = gzReader
-	}
-	return io.ReadAll(reader)
-}
-func parseNDJSON(data []byte) []map[string]interface{} {
-	var result []map[string]interface{}
-	lines := bytes.Split(data, []byte("\n"))
-	for _, line := range lines {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
-		var obj map[string]interface{}
-		if err := json.Unmarshal(line, &obj); err == nil {
-			result = append(result, obj)
-		}
-	}
-	return result
-}
-func parseIncompleteJSONArray(data []byte) []map[string]interface{} {
-	var result []map[string]interface{}
-	if err := json.Unmarshal(data, &result); err == nil {
-		return result
-	}
-
-	// 检查是否以 [ 开头但没有正确闭合
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		// 尝试添加 ] 闭合
-		if trimmed[len(trimmed)-1] != ']' {
-			// 找到最后一个完整的 } 并在其后添加 ]
-			lastBrace := bytes.LastIndex(trimmed, []byte("}"))
-			if lastBrace > 0 {
-				fixed := append(trimmed[:lastBrace+1], ']')
-				if err := json.Unmarshal(fixed, &result); err == nil {
-					log.Printf("⚠️ JSON 数组不完整，已修复并解析成功")
-					return result
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// ==================== 账号操作 ====================
-
-func (acc *Account) getCookie(name string) string {
-	for _, c := range acc.Data.Cookies {
-		if c.Name == name {
-			return c.Value
-		}
-	}
-	return ""
-}
-
-func (acc *Account) RefreshJWT() error {
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
-
-	// JWT 未过期，直接返回
-	if time.Now().Before(acc.JWTExpires) {
-		return nil
-	}
-
-	// 冷却期内，跳过刷新
-	if time.Since(acc.LastRefresh) < refreshCooldown {
-		return fmt.Errorf("刷新冷却中，剩余 %.0f 秒", (refreshCooldown - time.Since(acc.LastRefresh)).Seconds())
-	}
-
-	secureSES := acc.getCookie("__Secure-C_SES")
-	hostOSES := acc.getCookie("__Host-C_OSES")
-
-	cookie := fmt.Sprintf("__Secure-C_SES=%s", secureSES)
-	if hostOSES != "" {
-		cookie += fmt.Sprintf("; __Host-C_OSES=%s", hostOSES)
-	}
-
-	req, _ := http.NewRequest("GET", "https://business.gemini.google/auth/getoxsrf", nil)
-	q := req.URL.Query()
-	q.Add("csesidx", acc.CSESIDX)
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Cookie", cookie)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", "https://business.gemini.google/")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("getoxsrf 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		body, _ := readResponseBody(resp)
-		// 401/403 表示账号失效，需要删除
-		if resp.StatusCode == 401 || resp.StatusCode == 403 {
-			return fmt.Errorf("账号失效: %d %s", resp.StatusCode, string(body))
-		}
-		// 其他状态码可能是临时问题
-		return fmt.Errorf("getoxsrf 失败: %d %s", resp.StatusCode, string(body))
-	}
-
-	body, _ := readResponseBody(resp)
-	txt := strings.TrimPrefix(string(body), ")]}'")
-	txt = strings.TrimSpace(txt)
-
-	var data struct {
-		XsrfToken string `json:"xsrfToken"`
-		KeyID     string `json:"keyId"`
-	}
-	if err := json.Unmarshal([]byte(txt), &data); err != nil {
-		return fmt.Errorf("解析 xsrf 响应失败: %w", err)
-	}
-
-	// 使用 RawURLEncoding 并补齐 padding
-	token := data.XsrfToken
-	switch len(token) % 4 {
-	case 2:
-		token += "=="
-	case 3:
-		token += "="
-	}
-	keyBytes, err := base64.URLEncoding.DecodeString(token)
-	if err != nil {
-		return fmt.Errorf("解码 xsrfToken 失败: %w", err)
-	}
-
-	acc.JWT = createJWT(keyBytes, data.KeyID, acc.CSESIDX)
-	acc.JWTExpires = time.Now().Add(JwtTTL)
-	acc.LastRefresh = time.Now() // 更新刷新时间
-
-	// 获取 configId
-	if acc.ConfigID == "" {
-		configID, err := acc.fetchConfigID()
-		if err != nil {
-			return fmt.Errorf("获取 configId 失败: %w", err)
-		}
-		acc.ConfigID = configID
-	}
-	return nil
-}
-
-func (acc *Account) GetJWT() (string, string, error) {
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
-	if acc.JWT == "" {
-		return "", "", fmt.Errorf("JWT 为空，账号未刷新")
-	}
-	return acc.JWT, acc.ConfigID, nil
-}
-func (acc *Account) fetchConfigID() (string, error) {
-	// 1. 优先使用账号文件中的 configId
-	if acc.Data.ConfigID != "" {
-		return acc.Data.ConfigID, nil
-	}
-	if DefaultConfig != "" {
-		return DefaultConfig, nil
-	}
-
-	return "", fmt.Errorf("未配置 configId，请设置 CONFIG_ID 环境变量或在账号文件中添加 configId 字段")
-}
+// 数据结构和号池管理已移至 pool.go
+// HTTP客户端和工具函数已移至 utils.go
 
 // ==================== Session 管理 ====================
 
@@ -952,11 +330,12 @@ func uploadContextFileByURL(jwt, configID, sessionName, imageURL, origAuth strin
 	return result.AddContextFileResponse.FileID, nil
 }
 
-// ==================== OpenAI 兼容接口 ====================
-
 type Message struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"` // string 或 []ContentPart
+	Role       string      `json:"role"`
+	Content    interface{} `json:"content"`                // string 或 []ContentPart
+	Name       string      `json:"name,omitempty"`         // 函数名称（tool角色时）
+	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`   // 工具调用（assistant角色时）
+	ToolCallID string      `json:"tool_call_id,omitempty"` // 工具调用ID（tool角色时）
 }
 
 type ContentPart struct {
@@ -969,12 +348,38 @@ type ImageURL struct {
 	URL string `json:"url"`
 }
 
+// OpenAI格式的工具定义
+type ToolDef struct {
+	Type     string      `json:"type"` // "function"
+	Function FunctionDef `json:"function"`
+}
+
+type FunctionDef struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+// 工具调用结果
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // "function"
+	Function FunctionCall `json:"function"`
+}
+
+type FunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 type ChatRequest struct {
 	Model       string    `json:"model"`
 	Messages    []Message `json:"messages"`
 	Stream      bool      `json:"stream"`
 	Temperature float64   `json:"temperature"`
 	TopP        float64   `json:"top_p"`
+	Tools       []ToolDef `json:"tools,omitempty"`       // 工具定义
+	ToolChoice  string    `json:"tool_choice,omitempty"` // "auto", "none", "required"
 }
 
 type ChatChoice struct {
@@ -1008,7 +413,6 @@ func createChunk(id string, created int64, model string, delta map[string]interf
 	return string(data)
 }
 
-// 从响应中提取内容（文本、图片或思考）
 func extractContentFromReply(replyMap map[string]interface{}, jwt, session, configID, origAuth string) (text string, imageData string, imageMime string, reasoning string) {
 	groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
 	if !ok {
@@ -1054,14 +458,13 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 			} else if strings.HasPrefix(mimeType, "video/") {
 				fileType = "视频"
 			}
-			log.Printf("📥 发现%s: fileId=%s, mimeType=%s", fileType, fileId, mimeType)
+			//	log.Printf("📥 发现%s: fileId=%s, mimeType=%s", fileType, fileId, mimeType)
 			data, err := downloadGeneratedFile(jwt, fileId, session, configID, origAuth)
 			if err != nil {
 				log.Printf("❌ 下载%s失败: %v", fileType, err)
 			} else {
 				imageData = data
 				imageMime = mimeType
-				log.Printf("✅ %s下载成功, 大小: %d bytes", fileType, len(data))
 			}
 		}
 	}
@@ -1139,13 +542,7 @@ func downloadGeneratedFile(jwt, fileId, session, configID, origAuth string) (str
 		return "", fmt.Errorf("未找到 fileId=%s 的文件信息", fileId)
 	}
 
-	// 构建下载 URL：使用 biz-discoveryengine 端点
-	// 格式: https://biz-discoveryengine.googleapis.com/download/v1alpha/{fullSession}:downloadFile?fileId={fileId}&alt=media
 	downloadURL := fmt.Sprintf("https://biz-discoveryengine.googleapis.com/download/v1alpha/%s:downloadFile?fileId=%s&alt=media", fullSession, fileId)
-
-	log.Printf("📥 下载图片 URL: %s", downloadURL)
-
-	// 步骤2: 下载图片（使用 biz-discoveryengine 端点和 JWT）
 	downloadReq, _ := http.NewRequest("GET", downloadURL, nil)
 	for k, v := range getCommonHeaders(jwt, origAuth) {
 		downloadReq.Header.Set(k, v)
@@ -1312,7 +709,6 @@ func parseMediaURL(urlStr, defaultType string) *MediaInfo {
 
 	// URL 媒体 - 优先尝试直接使用 URL 上传
 	mediaType := defaultType
-	// 根据 URL 后缀推断媒体类型
 	lowerURL := strings.ToLower(urlStr)
 	if strings.HasSuffix(lowerURL, ".mp4") || strings.HasSuffix(lowerURL, ".webm") ||
 		strings.HasSuffix(lowerURL, ".mov") || strings.HasSuffix(lowerURL, ".avi") ||
@@ -1360,8 +756,6 @@ func downloadMedia(urlStr, mediaType string) (string, string, error) {
 	if mimeType == "" {
 		mimeType = "image/jpeg"
 	}
-
-	// 只有 jpeg 和 png 是支持的格式，其他都需要转换
 	needConvert := !strings.Contains(mimeType, "jpeg") && !strings.Contains(mimeType, "png")
 	if needConvert {
 		converted, err := convertToPNG(data)
@@ -1432,14 +826,207 @@ func convertBase64ToPNG(base64Data string) (string, error) {
 
 const maxRetries = 3
 
+// convertMessagesToPrompt 将多轮对话转换为Gemini格式的prompt
+// extractSystemPrompt 提取并返回系统提示词
+func extractSystemPrompt(messages []Message) string {
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			text, _ := parseMessageContent(msg)
+			return text
+		}
+	}
+	return ""
+}
+
+// convertMessagesToPrompt 将多轮对话转换为带系统提示词的prompt
+// 支持OpenAI/Claude/Gemini格式的messages
+func convertMessagesToPrompt(messages []Message) string {
+	var dialogParts []string
+	var systemPrompt string
+
+	for _, msg := range messages {
+		text, _ := parseMessageContent(msg)
+		if text == "" && msg.Role != "assistant" {
+			continue
+		}
+
+		switch msg.Role {
+		case "system":
+			// 支持多个system消息拼接
+			if systemPrompt != "" {
+				systemPrompt += "\n" + text
+			} else {
+				systemPrompt = text
+			}
+		case "user", "human": // Claude使用human
+			dialogParts = append(dialogParts, fmt.Sprintf("Human: %s", text))
+		case "assistant":
+			// 检查是否有工具调用
+			if len(msg.ToolCalls) > 0 {
+				for _, tc := range msg.ToolCalls {
+					dialogParts = append(dialogParts, fmt.Sprintf("Assistant: [调用工具 %s(%s)]", tc.Function.Name, tc.Function.Arguments))
+				}
+			} else if text != "" {
+				dialogParts = append(dialogParts, fmt.Sprintf("Assistant: %s", text))
+			}
+		case "tool", "tool_result": // Claude使用tool_result
+			dialogParts = append(dialogParts, fmt.Sprintf("Tool Result [%s]: %s", msg.Name, text))
+		}
+	}
+
+	// 组合最终prompt，系统提示词使用更强的格式
+	var result strings.Builder
+	if systemPrompt != "" {
+		// 使用更明确的系统提示词格式，确保生效
+		result.WriteString("<system>\n")
+		result.WriteString(systemPrompt)
+		result.WriteString("\n</system>\n\n")
+	}
+	if len(dialogParts) > 0 {
+		result.WriteString(strings.Join(dialogParts, "\n\n"))
+	}
+	// 添加Assistant前缀引导回复
+	result.WriteString("\n\nAssistant:")
+	return result.String()
+}
+
+// buildToolsSpec 将OpenAI格式的工具定义转换为Gemini的toolsSpec
+func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel bool) map[string]interface{} {
+	toolsSpec := make(map[string]interface{})
+
+	// 基础工具
+	if isImageModel {
+		toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
+	} else if isVideoModel {
+		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
+	} else {
+		// 普通模型启用所有内置工具
+		toolsSpec["webGroundingSpec"] = map[string]interface{}{}
+		toolsSpec["toolRegistry"] = "default_tool_registry"
+		toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
+		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
+	}
+
+	// 如果有自定义工具，添加functionDeclarations
+	if len(tools) > 0 {
+		var functionDeclarations []map[string]interface{}
+		for _, tool := range tools {
+			if tool.Type == "function" {
+				funcDecl := map[string]interface{}{
+					"name":        tool.Function.Name,
+					"description": tool.Function.Description,
+				}
+				if tool.Function.Parameters != nil && len(tool.Function.Parameters) > 0 {
+					funcDecl["parameters"] = tool.Function.Parameters
+				}
+				functionDeclarations = append(functionDeclarations, funcDecl)
+			}
+		}
+		if len(functionDeclarations) > 0 {
+			toolsSpec["functionDeclarations"] = functionDeclarations
+		}
+	}
+
+	return toolsSpec
+}
+
+// extractToolCalls 从Gemini响应中提取工具调用
+func extractToolCalls(dataList []map[string]interface{}) []ToolCall {
+	var toolCalls []ToolCall
+
+	for _, data := range dataList {
+		streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		answer, ok := streamResp["answer"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		replies, ok := answer["replies"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, reply := range replies {
+			replyMap, ok := reply.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			content, ok := groundedContent["content"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// 检查functionCall
+			if fc, ok := content["functionCall"].(map[string]interface{}); ok {
+				name, _ := fc["name"].(string)
+				args, _ := fc["args"].(map[string]interface{})
+				argsBytes, _ := json.Marshal(args)
+
+				toolCalls = append(toolCalls, ToolCall{
+					ID:   "call_" + uuid.New().String()[:8],
+					Type: "function",
+					Function: FunctionCall{
+						Name:      name,
+						Arguments: string(argsBytes),
+					},
+				})
+			}
+		}
+	}
+
+	return toolCalls
+}
+
+// needsConversationContext 检查是否需要对话上下文（多轮对话）
+func needsConversationContext(messages []Message) bool {
+	// 检查是否有多轮对话标志：存在assistant或tool消息
+	for _, msg := range messages {
+		if msg.Role == "assistant" || msg.Role == "tool" || msg.Role == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
 func streamChat(c *gin.Context, req ChatRequest) {
 	chatID := "chatcmpl-" + uuid.New().String()
 	createdTime := time.Now().Unix()
+	clientIP := c.ClientIP()
+	// 入站日志
+	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
+	// 解析消息：支持多轮对话拼接和系统提示词
+	var textContent string
+	var images []MediaInfo
+	// 提取系统提示词
+	systemPrompt := extractSystemPrompt(req.Messages)
+	if needsConversationContext(req.Messages) {
+		// 多轮对话：拼接所有消息（包含system）
+		textContent = convertMessagesToPrompt(req.Messages)
+		// 只从最后一条用户消息提取图片
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role == "user" || req.Messages[i].Role == "human" {
+				_, images = parseMessageContent(req.Messages[i])
+				break
+			}
+		}
+	} else {
+		// 简单情况：处理最后一条用户消息
+		lastMsg := req.Messages[len(req.Messages)-1]
+		userText, userImages := parseMessageContent(lastMsg)
+		images = userImages
 
-	// 解析最后一条消息
-	lastMsg := req.Messages[len(req.Messages)-1]
-	textContent, images := parseMessageContent(lastMsg)
-
+		// 系统提示词使用强格式拼接，确保生效
+		if systemPrompt != "" {
+			textContent = fmt.Sprintf("<system>\n%s\n</system>\n\nHuman: %s\n\nAssistant:", systemPrompt, userText)
+		} else {
+			textContent = userText
+		}
+	}
 	var respBody []byte
 	var lastErr error
 	var usedAcc *Account
@@ -1452,6 +1039,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			return
 		}
 		usedAcc = acc
+		log.Printf("📤 [%s] 使用账号: %s", clientIP, acc.Data.Email)
 
 		if retry > 0 {
 			log.Printf("🔄 第 %d 次重试，切换账号: %s", retry+1, acc.Data.Email)
@@ -1524,27 +1112,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		isVideoModel := strings.HasSuffix(req.Model, "-video")
 		actualModel := strings.TrimSuffix(strings.TrimSuffix(req.Model, "-image"), "-video")
 
-		// 构建 toolsSpec
-		var toolsSpec map[string]interface{}
-		if isImageModel {
-			// -image 模型只启用图片生成
-			toolsSpec = map[string]interface{}{
-				"imageGenerationSpec": map[string]interface{}{},
-			}
-		} else if isVideoModel {
-			// -video 模型只启用视频生成
-			toolsSpec = map[string]interface{}{
-				"videoGenerationSpec": map[string]interface{}{},
-			}
-		} else {
-			// 普通模型启用所有工具
-			toolsSpec = map[string]interface{}{
-				"webGroundingSpec":    map[string]interface{}{},
-				"toolRegistry":        "default_tool_registry",
-				"imageGenerationSpec": map[string]interface{}{},
-				"videoGenerationSpec": map[string]interface{}{},
-			}
-		}
+		// 构建 toolsSpec（支持自定义工具）
+		toolsSpec := buildToolsSpec(req.Tools, isImageModel, isVideoModel)
 
 		body := map[string]interface{}{
 			"configId":         configID,
@@ -1732,7 +1301,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			log.Printf("⚠️ 响应中未找到 session 且无回退 session，图片/视频下载可能失败")
 		}
 	} else {
-		log.Printf("✅ 获取到 session: %s", respSession)
 	}
 
 	// 待下载的文件信息
@@ -1755,10 +1323,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		fmt.Fprintf(writer, "data: %s\n\n", chunk)
 		flusher.Flush()
 
-		// 收集待下载的文件
+		// 收集待下载的文件和工具调用
 		var pendingFiles []PendingFile
-
-		// 第一遍：实时输出文本和思考，收集文件信息
+		hasToolCalls := false
 		for _, data := range dataList {
 			streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
 			if !ok {
@@ -1772,13 +1339,11 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			if !ok {
 				continue
 			}
-
 			for _, reply := range replies {
 				replyMap, ok := reply.(map[string]interface{})
 				if !ok {
 					continue
 				}
-
 				groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
 				if !ok {
 					continue
@@ -1787,7 +1352,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				if !ok {
 					continue
 				}
-
 				// 检查是否是思考内容
 				if thought, ok := content["thought"].(bool); ok && thought {
 					if t, ok := content["text"].(string); ok && t != "" {
@@ -1797,7 +1361,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					}
 					continue
 				}
-
 				// 输出文本（实时）
 				if t, ok := content["text"].(string); ok && t != "" {
 					chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": t}, nil)
@@ -1825,29 +1388,70 @@ func streamChat(c *gin.Context, req ChatRequest) {
 						pendingFiles = append(pendingFiles, PendingFile{FileID: fileId, MimeType: mimeType})
 					}
 				}
+				if fc, ok := content["functionCall"].(map[string]interface{}); ok {
+					hasToolCalls = true
+					name, _ := fc["name"].(string)
+					args, _ := fc["args"].(map[string]interface{})
+					argsBytes, _ := json.Marshal(args)
+
+					toolCall := ToolCall{
+						ID:   "call_" + uuid.New().String()[:8],
+						Type: "function",
+						Function: FunctionCall{
+							Name:      name,
+							Arguments: string(argsBytes),
+						},
+					}
+					chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{
+						"tool_calls": []map[string]interface{}{{
+							"index": 0,
+							"id":    toolCall.ID,
+							"type":  "function",
+							"function": map[string]interface{}{
+								"name":      toolCall.Function.Name,
+								"arguments": toolCall.Function.Arguments,
+							},
+						}},
+					}, nil)
+					fmt.Fprintf(writer, "data: %s\n\n", chunk)
+					flusher.Flush()
+				}
 			}
 		}
-
-		// 第二遍：下载并输出文件（图片/视频）
 		if len(pendingFiles) > 0 {
 			log.Printf("📥 开始下载 %d 个文件...", len(pendingFiles))
-			for _, pf := range pendingFiles {
-				fileType := "文件"
-				if strings.HasPrefix(pf.MimeType, "image/") {
-					fileType = "图片"
-				} else if strings.HasPrefix(pf.MimeType, "video/") {
-					fileType = "视频"
-				}
-				log.Printf("📥 下载%s: fileId=%s", fileType, pf.FileID)
+			type downloadResult struct {
+				Index    int
+				Data     string
+				MimeType string
+				Err      error
+			}
+			results := make(chan downloadResult, len(pendingFiles))
+			var wg sync.WaitGroup
+			for i, pf := range pendingFiles {
+				wg.Add(1)
+				go func(idx int, file PendingFile) {
+					defer wg.Done()
+					data, err := downloadGeneratedFile(usedJWT, file.FileID, respSession, usedConfigID, usedOrigAuth)
+					results <- downloadResult{Index: idx, Data: data, MimeType: file.MimeType, Err: err}
+				}(i, pf)
+			}
+			go func() {
+				wg.Wait()
+				close(results)
+			}()
+			downloaded := make([]downloadResult, len(pendingFiles))
+			for r := range results {
+				downloaded[r.Index] = r
+			}
 
-				data, err := downloadGeneratedFile(usedJWT, pf.FileID, respSession, usedConfigID, usedOrigAuth)
-				if err != nil {
-					log.Printf("❌ 下载%s失败: %v", fileType, err)
+			// 按顺序输出
+			for i, r := range downloaded {
+				if r.Err != nil {
+					log.Printf("❌ 下载文件[%d]失败: %v", i, r.Err)
 					continue
 				}
-				log.Printf("✅ %s下载成功, 大小: %d bytes", fileType, len(data))
-
-				imgMarkdown := formatImageAsMarkdown(pf.MimeType, data)
+				imgMarkdown := formatImageAsMarkdown(r.MimeType, r.Data)
 				chunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{"content": imgMarkdown}, nil)
 				fmt.Fprintf(writer, "data: %s\n\n", chunk)
 				flusher.Flush()
@@ -1855,13 +1459,15 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		}
 
 		// 发送结束
-		stopReason := "stop"
-		finalChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{}, &stopReason)
+		finishReason := "stop"
+		if hasToolCalls {
+			finishReason = "tool_calls"
+		}
+		finalChunk := createChunk(chatID, createdTime, req.Model, map[string]interface{}{}, &finishReason)
 		fmt.Fprintf(writer, "data: %s\n\n", finalChunk)
 		fmt.Fprintf(writer, "data: [DONE]\n\n")
 		flusher.Flush()
 	} else {
-		// 非流式响应：统一处理
 		var fullContent strings.Builder
 		var fullReasoning strings.Builder
 		replyCount := 0
@@ -1887,8 +1493,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					continue
 				}
 				replyCount++
-
-				// 检查是否有 file 字段
 				if gc, ok := replyMap["groundedContent"].(map[string]interface{}); ok {
 					if content, ok := gc["content"].(map[string]interface{}); ok {
 						if _, ok := content["file"]; ok {
@@ -1898,7 +1502,6 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				}
 
 				text, imageData, imageMime, reasoning := extractContentFromReply(replyMap, usedJWT, respSession, usedConfigID, usedOrigAuth)
-
 				if reasoning != "" {
 					fullReasoning.WriteString(reasoning)
 				}
@@ -1910,10 +1513,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				}
 			}
 		}
-
+		toolCalls := extractToolCalls(dataList)
 		// 调试日志
-		log.Printf("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d",
-			replyCount, hasFile, fullContent.Len(), fullReasoning.Len())
+		log.Printf("📊 非流式响应统计: %d 个 reply, 包含文件=%v, content长度=%d, reasoning长度=%d, 工具调用=%d",
+			replyCount, hasFile, fullContent.Len(), fullReasoning.Len(), len(toolCalls))
 
 		// 构建响应消息
 		message := gin.H{
@@ -1923,7 +1526,12 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if fullReasoning.Len() > 0 {
 			message["reasoning_content"] = fullReasoning.String()
 		}
-
+		finishReason := "stop"
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+			message["content"] = nil
+			finishReason = "tool_calls"
+		}
 		c.JSON(200, gin.H{
 			"id":      chatID,
 			"object":  "chat.completion",
@@ -1932,7 +1540,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			"choices": []gin.H{{
 				"index":         0,
 				"message":       message,
-				"finish_reason": "stop",
+				"finish_reason": finishReason,
 			}},
 			"usage": gin.H{
 				"prompt_tokens":     0,
@@ -1942,18 +1550,12 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		})
 	}
 }
-
-// ==================== API Key 鉴权 ====================
-
 func apiKeyAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 如果没有配置 API Key，跳过鉴权
 		if len(appConfig.APIKeys) == 0 {
 			c.Next()
 			return
 		}
-
-		// 从 Header 获取 API Key
 		authHeader := c.GetHeader("Authorization")
 		apiKey := ""
 
@@ -1987,19 +1589,10 @@ func apiKeyAuth() gin.HandlerFunc {
 		c.Next()
 	}
 }
-
-// ==================== 路由 ====================
-
 func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
-
-	// 加载配置
 	loadAppConfig()
-
-	// 初始化 HTTP 客户端（使用配置的代理）
 	initHTTPClient()
-
-	// 加载账号池（所有账号进入 pending 池）
 	if err := pool.Load(DataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
@@ -2024,36 +1617,45 @@ func main() {
 			log.Printf("⚠️ 注册脚本不存在: %s", scriptPath)
 		}
 	}
-
-	// 异步启动号池管理器（负责刷新账号）
 	if appConfig.Pool.RefreshOnStartup {
 		pool.StartPoolManager()
 	}
-
-	// 如果账号数为 0，尝试自动注册
 	if pool.TotalCount() == 0 && appConfig.Pool.RegisterScript != "" {
 		needCount := appConfig.Pool.TargetCount
 		log.Printf("📝 无账号，启动注册 %d 个...", needCount)
 		startRegister(needCount)
 	}
-
-	// 启动号池维护协程（检查账号数量并触发注册）
 	if appConfig.Pool.CheckIntervalMinutes > 0 && appConfig.Pool.RegisterScript != "" {
 		go poolMaintainer()
 	}
-
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-
-	// 日志中间件
 	r.Use(func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
 		log.Printf("%s %s %d %v", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start))
 	})
 
-	// 健康检查（无需鉴权）
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status":  "running",
+			"service": "business2api",
+			"version": "1.0.0",
+			"endpoints": gin.H{
+				"openai": "/v1/chat/completions",
+				"claude": "/v1/messages",
+				"gemini": "/v1beta/models/{model}:generateContent",
+				"models": "/v1/models",
+				"health": "/health",
+			},
+			"pool": gin.H{
+				"ready":   pool.ReadyCount(),
+				"pending": pool.PendingCount(),
+				"total":   pool.TotalCount(),
+			},
+		})
+	})
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"status":  "ok",
@@ -2062,12 +1664,8 @@ func main() {
 			"pending": pool.PendingCount(),
 		})
 	})
-
-	// 需要鉴权的路由组
 	api := r.Group("/")
 	api.Use(apiKeyAuth())
-
-	// 模型列表
 	api.GET("/v1/models", func(c *gin.Context) {
 		now := time.Now().Unix()
 		var models []gin.H
@@ -2083,7 +1681,6 @@ func main() {
 		c.JSON(200, gin.H{"object": "list", "data": models})
 	})
 
-	// 聊天接口
 	api.POST("/v1/chat/completions", func(c *gin.Context) {
 		var req ChatRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -2097,12 +1694,11 @@ func main() {
 
 		streamChat(c, req)
 	})
-
-	// 管理接口
+	api.POST("/v1/messages", handleClaudeMessages)
+	api.POST("/v1beta/models/*action", handleGeminiGenerate)
+	api.POST("/v1/models/*action", handleGeminiGenerate)
 	admin := r.Group("/admin")
 	admin.Use(apiKeyAuth())
-
-	// 手动触发注册
 	admin.POST("/register", func(c *gin.Context) {
 		var req struct {
 			Count int `json:"count"`
@@ -2120,8 +1716,6 @@ func main() {
 		}
 		c.JSON(200, gin.H{"message": "注册已启动", "target": req.Count})
 	})
-
-	// 刷新账号池
 	admin.POST("/refresh", func(c *gin.Context) {
 		pool.Load(DataDir)
 		c.JSON(200, gin.H{

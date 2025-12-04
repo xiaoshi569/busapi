@@ -161,6 +161,10 @@ var FixedModels = []string{
 	"gemini-2.5-pro-video",
 	"gemini-3-pro-preview-video",
 	"gemini-3-pro-video",
+	"gemini-2.5-flash-search",
+	"gemini-2.5-pro-search",
+	"gemini-3-pro-preview-search",
+	"gemini-3-pro-search",
 }
 
 // 模型名称映射到 Google API 的 modelId
@@ -976,7 +980,7 @@ func convertMessagesToPrompt(messages []Message) string {
 }
 
 // buildToolsSpec 将OpenAI格式的工具定义转换为Gemini的toolsSpec
-func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel bool) map[string]interface{} {
+func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel, isSearchModel bool) map[string]interface{} {
 	toolsSpec := make(map[string]interface{})
 
 	// 基础工具
@@ -984,6 +988,9 @@ func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel bool) map[string
 		toolsSpec["imageGenerationSpec"] = map[string]interface{}{}
 	} else if isVideoModel {
 		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
+	} else if isSearchModel {
+		// 搜索模型只启用 webGroundingSpec
+		toolsSpec["webGroundingSpec"] = map[string]interface{}{}
 	} else {
 		// 普通模型启用所有内置工具
 		toolsSpec["webGroundingSpec"] = map[string]interface{}{}
@@ -1137,6 +1144,11 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 		// 启动心跳 goroutine
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// 忽略写入已关闭连接的 panic
+				}
+			}()
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -1145,7 +1157,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 					return
 				case <-ticker.C:
 					// 发送空格作为心跳（不影响 JSON 解析）
-					writer.Write([]byte(" "))
+					if _, err := writer.Write([]byte(" ")); err != nil {
+						return // 写入失败说明连接已关闭
+					}
 					if flusher, ok := writer.(http.Flusher); ok {
 						flusher.Flush()
 					}
@@ -1153,6 +1167,18 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 		}()
 	}
+
+	// 确保心跳 goroutine 在函数退出时停止
+	defer func() {
+		if heartbeatDone != nil {
+			select {
+			case <-heartbeatDone:
+				// 已关闭
+			default:
+				close(heartbeatDone)
+			}
+		}
+	}()
 
 	for retry := 0; retry < maxRetries; retry++ {
 		acc := pool.Next()
@@ -1241,10 +1267,11 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 检查模型类型后缀
 		isImageModel := strings.HasSuffix(req.Model, "-image")
 		isVideoModel := strings.HasSuffix(req.Model, "-video")
-		actualModel := strings.TrimSuffix(strings.TrimSuffix(req.Model, "-image"), "-video")
+		isSearchModel := strings.HasSuffix(req.Model, "-search")
+		actualModel := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(req.Model, "-image"), "-video"), "-search")
 
 		// 构建 toolsSpec（支持自定义工具）
-		toolsSpec := buildToolsSpec(req.Tools, isImageModel, isVideoModel)
+		toolsSpec := buildToolsSpec(req.Tools, isImageModel, isVideoModel, isSearchModel)
 
 		body := map[string]interface{}{
 			"configId":         configID,
@@ -1793,23 +1820,13 @@ func runBrowserRefreshMode(email string) {
 		}
 		log.Fatal("❌ 没有可用账号")
 	}
-
-	log.Printf("📧 目标账号: %s", targetAcc.Data.Email)
-	log.Printf("🔧 ConfigID: %s", targetAcc.Data.ConfigID)
-	log.Printf("🔧 CSESIDX: %s", targetAcc.CSESIDX)
-	log.Println("🚀 启动浏览器刷新...")
-
 	result := RefreshCookieWithBrowser(targetAcc, false, Proxy)
 
 	if result.Success {
-		log.Println("✅ 刷新成功!")
-		log.Printf("   Authorization: %s...", result.Authorization[:50])
-		log.Printf("   Cookies: %d 个", len(result.SecureCookies))
+
 		if len(result.NewCookies) > 0 {
-			log.Printf("   新Cookie: %d 个", len(result.NewCookies))
 		}
 		if len(result.ResponseHeaders) > 0 {
-			log.Printf("   捕获响应头: %d 个", len(result.ResponseHeaders))
 		}
 
 		// 更新账号数据

@@ -346,12 +346,9 @@ func (p *AccountPool) refreshWorker(id int) {
 					acc.mu.Lock()
 					acc.BrowserRefreshCount++
 					acc.mu.Unlock()
-
-					log.Printf("🌐 [worker-%d] [%s] 尝试浏览器刷新 (%d/%d)...", id, acc.Data.Email, browserRefreshCount+1, BrowserRefreshMaxRetry)
 					refreshResult := RefreshCookieWithBrowser(acc, BrowserRefreshHeadless, Proxy)
 
 					if refreshResult.Success {
-						// 更新账号数据（完整的重新登录结果）
 						acc.mu.Lock()
 						acc.Data.Cookies = refreshResult.SecureCookies
 						if refreshResult.Authorization != "" {
@@ -365,7 +362,6 @@ func (p *AccountPool) refreshWorker(id int) {
 							acc.CSESIDX = refreshResult.CSESIDX
 							acc.Data.CSESIDX = refreshResult.CSESIDX
 						}
-						// 保存响应头（用于调试和追踪）
 						if len(refreshResult.ResponseHeaders) > 0 {
 							acc.Data.ResponseHeaders = refreshResult.ResponseHeaders
 						}
@@ -379,8 +375,6 @@ func (p *AccountPool) refreshWorker(id int) {
 						if err := acc.SaveToFile(); err != nil {
 							log.Printf("⚠️ [%s] 保存刷新后的账号失败: %v", acc.Data.Email, err)
 						}
-
-						log.Printf("✅ [worker-%d] [%s] 浏览器重新登录成功，重新加入刷新队列", id, acc.Data.Email)
 						p.mu.Lock()
 						p.pendingAccounts = append(p.pendingAccounts, acc)
 						p.mu.Unlock()
@@ -391,14 +385,12 @@ func (p *AccountPool) refreshWorker(id int) {
 				} else if browserRefreshCount >= BrowserRefreshMaxRetry && BrowserRefreshMaxRetry > 0 {
 					log.Printf("⚠️ [worker-%d] [%s] 已达浏览器刷新上限 (%d次)，跳过浏览器刷新", id, acc.Data.Email, BrowserRefreshMaxRetry)
 				}
-
-				// 浏览器刷新失败或已达上限：累计失败次数，稍后重试（不删除账号）
 				acc.mu.Lock()
 				acc.FailCount++
 				failCount := acc.FailCount
 				acc.mu.Unlock()
 
-				waitTime := time.Duration(failCount*30) * time.Second // 递增等待：30s, 60s, 90s...
+				waitTime := time.Duration(failCount*30) * time.Second
 				if waitTime > 5*time.Minute {
 					waitTime = 5 * time.Minute // 最大等待5分钟
 				}

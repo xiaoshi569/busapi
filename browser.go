@@ -140,7 +140,33 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 	}
 	return email, nil
 }
+
+// getEmailCount 获取当前邮件数量
+func getEmailCount(email string) int {
+	req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	req.Header.Set("Referer", "https://mail.chatgpt.org.uk")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	body, _ := readResponseBody(resp)
+	var result EmailListResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0
+	}
+	return len(result.Data.Emails)
+}
+
 func getVerificationEmailQuick(email string, retries int, intervalSec int) (*EmailContent, error) {
+	return getVerificationEmailAfter(email, retries, intervalSec, 0)
+}
+
+// getVerificationEmailAfter 获取包含有效验证码的新邮件
+func getVerificationEmailAfter(email string, retries int, intervalSec int, initialCount int) (*EmailContent, error) {
 	for i := 0; i < retries; i++ {
 		req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
@@ -161,8 +187,14 @@ func getVerificationEmailQuick(email string, retries int, intervalSec int) (*Ema
 			continue
 		}
 
-		if result.Success && len(result.Data.Emails) > 0 {
-			return &result.Data.Emails[0], nil
+		// 检查是否有新邮件（数量增加）且包含有效验证码
+		if result.Success && len(result.Data.Emails) > initialCount {
+			// 验证最新邮件是否包含有效验证码
+			latestEmail := &result.Data.Emails[0]
+			if _, err := extractVerificationCode(latestEmail.Content); err == nil {
+				return latestEmail, nil
+			}
+			// 验证码提取失败，继续等待新邮件
 		}
 		time.Sleep(time.Duration(intervalSec) * time.Second)
 	}
@@ -756,8 +788,6 @@ func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) er
 	return nil
 }
 
-// ==================== 浏览器 Cookie 刷新（重新登录） ====================
-
 // BrowserRefreshResult Cookie刷新结果
 type BrowserRefreshResult struct {
 	Success         bool
@@ -770,20 +800,15 @@ type BrowserRefreshResult struct {
 	Error           error
 }
 
-// RefreshCookieWithBrowser 使用浏览器重新登录刷新Cookie（用于401账号）
-// 流程：注入老Cookie → 访问页面 → 输入邮箱 → 获取验证码 → 完成登录
 func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *BrowserRefreshResult {
 	result := &BrowserRefreshResult{}
 	email := acc.Data.Email
 
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[Cookie刷新] ☠️ [%s] panic: %v", email, r)
 			result.Error = fmt.Errorf("panic: %v", r)
 		}
 	}()
-
-	log.Printf("[Cookie刷新] 🔄 [%s] 开始刷新流程...", email)
 
 	// 启动浏览器
 	l := launcher.New()
@@ -899,68 +924,8 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		}
 	})()
 
-	// 注入关键 Cookie（使用 CDP Storage.setCookies）
-	existingCookies := acc.Data.GetAllCookies()
-	if len(existingCookies) > 0 {
-		log.Printf("[Cookie刷新] [%s] 注入 %d 个现有Cookie", email, len(existingCookies))
-
-		for _, c := range existingCookies {
-			var url, domain string
-
-			// 根据 cookie 名称和原始域名确定正确的设置方式
-			switch {
-			case strings.HasPrefix(c.Name, "__Host-"):
-				// __Host- cookie 必须使用 URL 方式设置，不能设置 Domain
-				url = "https://business.gemini.google/"
-				domain = ""
-			case strings.HasPrefix(c.Name, "__Secure-"):
-				// __Secure- cookie
-				url = "https://business.gemini.google/"
-				domain = "business.gemini.google"
-			case c.Domain != "":
-				domain = c.Domain
-				if strings.HasSuffix(c.Domain, "gemini.google") {
-					url = "https://business.gemini.google/"
-				}
-			default:
-				domain = ".gemini.google"
-				url = "https://business.gemini.google/"
-			}
-
-			cookie := &proto.NetworkCookieParam{
-				Name:     c.Name,
-				Value:    c.Value,
-				Path:     "/",
-				Secure:   true,
-				SameSite: proto.NetworkCookieSameSiteNone,
-			}
-			if url != "" {
-				cookie.URL = url
-			}
-			if domain != "" {
-				cookie.Domain = domain
-			}
-
-			err := page.SetCookies([]*proto.NetworkCookieParam{cookie})
-			status := "✓"
-			if err != nil {
-				status = fmt.Sprintf("✗ %v", err)
-			}
-			log.Printf("[Cookie刷新] [%s]   %s %s = %s... (url: %s, domain: %s)",
-				email, status, c.Name, c.Value[:min(20, len(c.Value))], url, domain)
-		}
-	}
-
-	// 导航到目标页面（带 csesidx 参数）
-	csesidxParam := acc.CSESIDX
-	if csesidxParam == "" {
-		csesidxParam = acc.Data.CSESIDX
-	}
+	// 导航到目标页面
 	targetURL := "https://business.gemini.google/"
-	if csesidxParam != "" {
-		targetURL = fmt.Sprintf("https://business.gemini.google/?csesidx=%s", csesidxParam)
-	}
-	log.Printf("[Cookie刷新] [%s] 导航到: %s", email, targetURL)
 	page.Navigate(targetURL)
 	page.WaitLoad()
 	time.Sleep(2 * time.Second)
@@ -971,6 +936,8 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 	if info != nil {
 		currentURL = info.URL
 	}
+	initialEmailCount := 0
+	maxCodeRetries := 3 // 验证码重试次数（必须在goto之前声明）
 
 	// 检查是否已经登录成功（有authorization）
 	if authorization != "" {
@@ -978,20 +945,24 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		goto extractResult
 	}
 
+	// 获取实际邮件数量
+	initialEmailCount = getEmailCount(email)
+
 	// 检查是否在登录页面需要输入邮箱
 	if _, err := page.Timeout(5 * time.Second).Element("input"); err == nil {
-		log.Printf("[Cookie刷新] [%s] 需要输入邮箱...", email)
 
-		// 输入邮箱
+		// 输入邮箱 - 先清空再输入
+		time.Sleep(500 * time.Millisecond)
 		page.Eval(`() => {
 			const inputs = document.querySelectorAll('input');
 			if (inputs.length > 0) {
+				inputs[0].value = '';
 				inputs[0].click();
 				inputs[0].focus();
 			}
 		}`)
-		time.Sleep(200 * time.Millisecond)
-		safeType(page, email, 15)
+		time.Sleep(300 * time.Millisecond)
+		safeType(page, email, 30)
 		time.Sleep(500 * time.Millisecond)
 		page.Eval(`() => {
 			const inputs = document.querySelectorAll('input');
@@ -1020,77 +991,62 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		}
 		time.Sleep(2 * time.Second)
 	}
-
-	// 等待验证码发送
-	log.Printf("[Cookie刷新] [%s] 等待验证码发送...", email)
 	time.Sleep(3 * time.Second)
 
-	// 等待并获取验证码邮件（持续点击重发按钮）
-	log.Printf("[Cookie刷新] [%s] 开始查询验证码邮件...", email)
-	{
+	// 验证码重试循环
+	for codeRetry := 0; codeRetry < maxCodeRetries; codeRetry++ {
+		if codeRetry > 0 {
+			log.Printf("[Cookie刷新] [%s] 验证码验证失败，重试 %d/%d", email, codeRetry+1, maxCodeRetries)
+			// 点击"重新发送验证码"按钮
+			page.Eval(`() => {
+				const links = document.querySelectorAll('a, span, button');
+				for (const el of links) {
+					const text = el.textContent || '';
+					if (text.includes('重新发送') || text.includes('Resend')) {
+						el.click();
+						return true;
+					}
+				}
+				return false;
+			}`)
+			time.Sleep(2 * time.Second)
+			// 更新邮件计数基准
+			initialEmailCount = getEmailCount(email)
+		}
+
 		var emailContent *EmailContent
 		maxWaitTime := 3 * time.Minute
 		startTime := time.Now()
-		clickCount := 0
 
 		for time.Since(startTime) < maxWaitTime {
-			// 尝试点击重发按钮 - 精确选择器
-			clickResult, _ := page.Eval(`() => {
-				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
-				const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
-				            document.querySelector('span.YuMlnb-vQzf8d');
-				
-				if (btn && btn.textContent.includes('重新发送')) {
-					// 点击按钮及其所有父元素
-					btn.click();
-					let parent = btn.parentElement;
-					while (parent && parent !== document.body) {
-						parent.click();
-						parent = parent.parentElement;
-					}
-					return {clicked: true};
-				}
-				return {clicked: false};
-			}`)
-
-			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
-				clickCount++
-				time.Sleep(1 * time.Second) // 点击后等待1秒
-			}
-
-			// 快速检查邮件
-			emailContent, _ = getVerificationEmailQuick(email, 1, 1) // 1次*1秒
+			// 快速检查新邮件（只接受数量增加的情况）
+			emailContent, _ = getVerificationEmailAfter(email, 1, 1, initialEmailCount)
 			if emailContent != nil {
 				break
 			}
-
-			log.Printf("[Cookie刷新] [%s] 等待邮件... (已等待 %v)", email, time.Since(startTime).Round(time.Second))
+			time.Sleep(2 * time.Second)
 		}
 
 		if emailContent == nil {
 			result.Error = fmt.Errorf("无法获取验证码邮件")
 			return result
 		}
+
 		// 提取验证码
 		code, err := extractVerificationCode(emailContent.Content)
 		if err != nil {
-			log.Printf("[Cookie刷新] [%s] 提取验证码失败，邮件可能是旧邮件: %v", email, err)
-			result.Error = err
-			return result
+			continue // 重试
 		}
+
 		// 输入验证码
 		time.Sleep(500 * time.Millisecond)
 		page.Eval(`() => {
 			const inputs = document.querySelectorAll('input');
-			if (inputs.length > 0) { inputs[0].value = ''; inputs[0].click(); inputs[0].focus(); }
+			for (const inp of inputs) { inp.value = ''; }
+			if (inputs.length > 0) { inputs[0].click(); inputs[0].focus(); }
 		}`)
-		time.Sleep(200 * time.Millisecond)
-		safeType(page, code, 15)
-		time.Sleep(500 * time.Millisecond)
-		page.Eval(`() => {
-			const inputs = document.querySelectorAll('input');
-			if (inputs.length > 0) { inputs[0].blur(); }
-		}`)
+		time.Sleep(300 * time.Millisecond)
+		safeType(page, code, 30)
 		time.Sleep(500 * time.Millisecond)
 
 		// 点击验证按钮
@@ -1113,10 +1069,19 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 			time.Sleep(1 * time.Second)
 		}
 		time.Sleep(2 * time.Second)
-	}
 
-	// 等待登录完成
-	log.Printf("[Cookie刷新] [%s] 等待登录完成...", email)
+		// 检测验证码错误
+		hasError, _ := page.Eval(`() => {
+			const text = document.body.innerText || '';
+			return text.includes('验证码有误') || text.includes('incorrect') || text.includes('wrong code') || text.includes('请重试');
+		}`)
+		if hasError != nil && hasError.Value.Bool() {
+			continue // 重试
+		}
+
+		// 验证成功，跳出重试循环
+		break
+	}
 	for i := 0; i < 15; i++ {
 		time.Sleep(2 * time.Second)
 
@@ -1190,8 +1155,6 @@ extractResult:
 	for _, c := range cookieMap {
 		resultCookies = append(resultCookies, c)
 	}
-
-	log.Printf("[Cookie刷新] [%s] 合并后 %d 个Cookie (新增 %d 个)", email, len(resultCookies), len(newCookiesFromResponse))
 
 	// 从URL提取最终信息
 	info, _ = page.Info()

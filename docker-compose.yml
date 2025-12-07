@@ -16,6 +16,10 @@ services:
       - TZ=Asia/Shanghai
       - LISTEN_ADDR=:8000
       - DATA_DIR=/app/data
+      # Docker 容器内运行浏览器需要的环境变量
+      - DISPLAY=:99
+      - CHROME_BIN=/usr/bin/chromium-browser
+      - CHROMIUM_FLAGS=--no-sandbox --disable-setuid-sandbox
       # - PROXY=http://proxy:port
       # - API_KEY=your-api-key
     healthcheck:

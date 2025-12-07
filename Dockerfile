@@ -26,11 +26,19 @@ RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     chromium \
+    chromium-chromedriver \
     nss \
     freetype \
     harfbuzz \
     ttf-freefont \
-    font-noto-cjk
+    font-noto-cjk \
+    dbus \
+    xvfb
+
+# 设置 Chromium 无沙盒模式（Docker 容器需要）
+ENV CHROME_BIN=/usr/bin/chromium-browser \
+    CHROME_PATH=/usr/lib/chromium/ \
+    CHROMIUM_FLAGS="--no-sandbox --disable-setuid-sandbox"
 
 # Copy binary from builder
 COPY --from=builder /app/business2api .

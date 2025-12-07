@@ -323,7 +323,7 @@ func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (s
 
 	// 使用 UTC 时间，因为 IMAP 邮件时间通常是 UTC
 	startTime := time.Now().UTC()
-	checkInterval := 3 * time.Second // 3秒检查一次，更快
+	checkInterval := 1 * time.Second // 1秒检查一次，更快
 	checkCount := 0
 
 	// 提取目标邮箱的用户名部分（用于在邮件正文中搜索）
@@ -342,9 +342,7 @@ func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (s
 			log.Printf("✅ 从QQ邮箱获取到验证码: %s (耗时 %v)", code, time.Since(startTime))
 			return code, nil
 		} else {
-			if checkCount <= 3 || checkCount%6 == 0 {
-				log.Printf("⏳ [检查 %d] 未找到新验证码邮件，继续等待... (已等待 %v)", checkCount, time.Since(startTime).Round(time.Second))
-			}
+			// 安静模式：不再打印每轮检查日志
 		}
 		time.Sleep(checkInterval)
 	}
@@ -355,6 +353,9 @@ func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (s
 // checkQQMailForCode 检查QQ邮箱中的验证码邮件
 // startTime: 只接受这个时间之后收到的邮件
 func checkQQMailForCode(server string, port int, email, authCode, targetEmail string, startTime time.Time) (string, error) {
+	// 控制邮件调试日志量，false 时仅在命中/结果时输出
+	const verboseEmailLog = false
+
 	// 连接IMAP服务器
 	addr := fmt.Sprintf("%s:%d", server, port)
 	c, err := client.DialTLS(addr, &tls.Config{ServerName: server})
@@ -379,7 +380,9 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		return "", fmt.Errorf("选择收件箱失败: %w", err)
 	}
 
-	log.Printf("📬 收件箱共 %d 封邮件 (最近: %d, 未读: %d)", mbox.Messages, mbox.Recent, mbox.Unseen)
+		if verboseEmailLog {
+			log.Printf("📬 收件箱共 %d 封邮件 (最近: %d, 未读: %d)", mbox.Messages, mbox.Recent, mbox.Unseen)
+		}
 
 	if mbox.Messages == 0 {
 		return "", nil // 没有邮件
@@ -392,7 +395,9 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		from = mbox.Messages - 19
 	}
 
-	log.Printf("📬 收件箱共 %d 封邮件，检查第 %d-%d 封", mbox.Messages, from, to)
+	if verboseEmailLog {
+		log.Printf("📬 收件箱共 %d 封邮件，检查第 %d-%d 封", mbox.Messages, from, to)
+	}
 
 	seqSet := new(imap.SeqSet)
 	seqSet.AddRange(from, to)
@@ -417,6 +422,7 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 	// 提取目标邮箱的用户名部分（用于在邮件正文中搜索）
 	targetUser := strings.Split(targetEmail, "@")[0]
 	checkedCount := 0
+	fallbackCode := ""
 	googleMailCount := 0
 
 	// 检查每封邮件
@@ -472,15 +478,19 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		}
 
 		// 先打印所有邮件信息用于调试
-		log.Printf("🔍 邮件 %d: 主题='%s', 发件人='%s', 时间=%v UTC",
-			checkedCount, subject, fromAddr, msgDate.Format("15:04:05"))
-		log.Printf("   收件人: %v, 原始收件人: %v", toAddrs, originalRecipients)
+		if verboseEmailLog {
+			log.Printf("🔍 邮件 %d: 主题='%s', 发件人='%s', 时间=%v UTC",
+				checkedCount, subject, fromAddr, msgDate.Format("15:04:05"))
+			log.Printf("   收件人: %v, 原始收件人: %v", toAddrs, originalRecipients)
+		}
 
 		// 关键修改：只处理在 startTime 之后收到的邮件（允许30秒误差）
 		// 这样可以避免读取旧的验证码邮件
 		if msgDate.Before(startTime.Add(-30 * time.Second)) {
-			log.Printf("   ⏭️ 跳过：邮件时间 %v 早于开始时间 %v",
-				msgDate.Format("15:04:05"), startTime.Format("15:04:05"))
+			if verboseEmailLog {
+				log.Printf("   ⏭️ 跳过：邮件时间 %v 早于开始时间 %v",
+					msgDate.Format("15:04:05"), startTime.Format("15:04:05"))
+			}
 			continue
 		}
 
@@ -510,8 +520,10 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		}
 
 		googleMailCount++
-		log.Printf("📧 [Google邮件 %d] 主题: %s, 发件人: %s, 时间: %v",
-			googleMailCount, subject, fromAddr, msgDate.Format("15:04:05"))
+		if verboseEmailLog {
+			log.Printf("📧 [Google邮件 %d] 主题: %s, 发件人: %s, 时间: %v",
+				googleMailCount, subject, fromAddr, msgDate.Format("15:04:05"))
+		}
 
 		// 检查邮件是否与目标邮箱相关
 		toMatched := false
@@ -534,24 +546,42 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		// 检查正文是否包含目标邮箱地址或用户名
 		bodyContainsTarget := strings.Contains(bodyStr, targetEmail) || strings.Contains(bodyStr, targetUser)
 
-		// 匹配条件：收件人匹配 或 原始收件人匹配 或 正文包含目标
-		isTargetMail := toMatched || originalMatched || bodyContainsTarget
-		
-		log.Printf("   收件人匹配=%v, 原始收件人匹配=%v, 正文包含目标=%v, 最终匹配=%v",
-			toMatched, originalMatched, bodyContainsTarget, isTargetMail)
+		// 匹配条件：收件人匹配 或 原始收件人匹配，正文命中作为兜底
+		if verboseEmailLog {
+			log.Printf("   收件人匹配=%v, 原始收件人匹配=%v, 正文包含目标=%v",
+				toMatched, originalMatched, bodyContainsTarget)
+		}
+
+		targetMatched := toMatched || originalMatched
+		if !targetMatched && !bodyContainsTarget {
+			continue
+		}
 
 		// 从邮件内容中提取验证码
 		code, err := extractVerificationCode(bodyStr)
 		if err == nil && code != "" {
-			log.Printf("✅ 从邮件正文提取到验证码: %s", code)
-			return code, nil
+			if targetMatched {
+				log.Printf("✅ 从邮件正文提取到验证码: %s (收件人命中)", code)
+				return code, nil
+			}
+			// 正文兜底先记录，继续找有没有收件人命中的更优邮件
+			if fallbackCode == "" {
+				fallbackCode = code
+				log.Printf("✅ 从正文兜底提取验证码（收件人未命中）: %s", code)
+			}
 		}
 
 		// 也尝试从主题中提取
 		code, err = extractVerificationCode(subject)
 		if err == nil && code != "" {
-			log.Printf("✅ 从邮件主题提取到验证码: %s", code)
-			return code, nil
+			if targetMatched {
+				log.Printf("✅ 从邮件主题提取到验证码: %s (收件人命中)", code)
+				return code, nil
+			}
+			if fallbackCode == "" {
+				fallbackCode = code
+				log.Printf("✅ 从主题兜底提取验证码（收件人未命中）: %s", code)
+			}
 		}
 
 		// 打印正文前200字符用于调试
@@ -559,7 +589,9 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		if len(preview) > 300 {
 			preview = preview[:300]
 		}
-		log.Printf("   正文预览: %s...", strings.ReplaceAll(preview, "\n", " "))
+		if verboseEmailLog {
+			log.Printf("   正文预览: %s...", strings.ReplaceAll(preview, "\n", " "))
+		}
 	}
 
 	// 检查 fetch 是否有错误
@@ -567,7 +599,14 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		return "", fmt.Errorf("获取邮件失败: %w", err)
 	}
 
-	log.Printf("📊 共检查 %d 封邮件，其中 %d 封是Google邮件", checkedCount, googleMailCount)
+	// 没有收件人命中的邮件，但有兜底验证码
+	if fallbackCode != "" {
+		return fallbackCode, nil
+	}
+
+	if verboseEmailLog {
+		log.Printf("📊 共检查 %d 封邮件，其中 %d 封是Google邮件", checkedCount, googleMailCount)
+	}
 	return "", nil // 未找到验证码
 }
 
@@ -660,6 +699,13 @@ func extractVerificationCode(content string) (string, error) {
 	// 先尝试解析 MIME 内容
 	decodedContent := decodeMimeContent(content)
 
+	// 0) 关键词附近优先提取（常见“验证码/verification code/one-time code”）
+	// 仅允许关键词后最多40个非数字字符，取到第一段即返回，避免抓到正文其它ID
+	reKeyword := regexp.MustCompile(`(?i)(?:验证码|verification code|one[-\\s]?time code|one[-\\s]?time password|otp|code)\\D{0,40}([A-Z0-9]{6})`)
+	if m := reKeyword.FindStringSubmatch(decodedContent); len(m) > 1 {
+		return m[1], nil
+	}
+
 	// Google 验证码格式通常是: G-XXXXXX 或纯6位字母数字
 	// 优先匹配 G- 开头的格式
 	reGoogle := regexp.MustCompile(`G-([A-Z0-9]{6})`)
@@ -667,27 +713,45 @@ func extractVerificationCode(content string) (string, error) {
 		return m[1], nil
 	}
 
-	// 匹配6位大写字母数字组合（必须包含字母和数字）
+	// 匹配6位大写字母数字组合
 	re := regexp.MustCompile(`\b([A-Z0-9]{6})\b`)
 	matches := re.FindAllStringSubmatch(decodedContent, -1)
 
+	hasLetterRe := regexp.MustCompile(`[A-Z]`)
+	hasDigitRe := regexp.MustCompile(`[0-9]`)
+	pureLetterRe := regexp.MustCompile(`^[A-Z]{6}$`)
 	for _, match := range matches {
 		code := match[1]
 		if commonWords[code] {
 			continue
 		}
-		// 验证码应该同时包含字母和数字
-		hasLetter := regexp.MustCompile(`[A-Z]`).MatchString(code)
-		hasDigit := regexp.MustCompile(`[0-9]`).MatchString(code)
+		hasLetter := hasLetterRe.MatchString(code)
+		hasDigit := hasDigitRe.MatchString(code)
+		// 先取字母数字混合（最常见也最可靠）
 		if hasLetter && hasDigit {
+			return code, nil
+		}
+		// 再取纯字母（已过滤常见无效词/全相同）
+		if hasLetter && !hasDigit && pureLetterRe.MatchString(code) {
+			if isAllSameChar(code) {
+				continue
+			}
+			switch code {
+			case "REJECT", "VERIFY", "CANCEL", "GOOGLE":
+				continue
+			}
 			return code, nil
 		}
 	}
 
-	// 如果没有找到字母数字混合的，尝试只有数字的（但排除常见的无效模式）
+	// 如果没有找到字母数字混合的，尝试只有数字的（纯字母容易误判为 REJECT 等）
 	for _, match := range matches {
 		code := match[1]
 		if commonWords[code] {
+			continue
+		}
+		// 仅接受纯数字，避免 REJECT 这类全字母串
+		if !regexp.MustCompile(`^[0-9]{6}$`).MatchString(code) {
 			continue
 		}
 		// 排除全是相同数字的情况（如 333333, 000000）

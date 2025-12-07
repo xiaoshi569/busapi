@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"mime"
+	"mime/quotedprintable"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"encoding/base64"
+
+	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/client"
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/launcher"
@@ -94,9 +102,41 @@ var tempMailProviders = []TempMailProvider{
 	// 备用邮箱服务可以在这里添加
 }
 
-func getTemporaryEmail() (string, error) {
-	var lastErr error
+// 随机字符集
+var randomChars = []rune("abcdefghijklmnopqrstuvwxyz0123456789")
 
+// generateRandomString 生成指定长度的随机字符串
+func generateRandomString(length int) string {
+	b := make([]rune, length)
+	for i := range b {
+		b[i] = randomChars[rand.Intn(len(randomChars))]
+	}
+	return string(b)
+}
+
+// generateCustomDomainEmail 生成自定义域名的随机邮箱
+func generateCustomDomainEmail(domain string) string {
+	prefix := generateRandomString(8 + rand.Intn(5)) // 8-12位随机前缀
+	return prefix + "@" + domain
+}
+
+// isQQImapConfigured 检查是否配置了QQ邮箱IMAP
+func isQQImapConfigured() bool {
+	return appConfig.Email.RegisterDomain != "" &&
+		appConfig.Email.QQImap.Address != "" &&
+		appConfig.Email.QQImap.AuthCode != ""
+}
+
+func getTemporaryEmail() (string, error) {
+	// 优先使用自定义域名（QQ邮箱转发方案）
+	if isQQImapConfigured() {
+		email := generateCustomDomainEmail(appConfig.Email.RegisterDomain)
+		log.Printf("📧 使用自定义域名邮箱: %s", email)
+		return email, nil
+	}
+
+	// 回退到临时邮箱服务
+	var lastErr error
 	for _, provider := range tempMailProviders {
 		email, err := getEmailFromProvider(provider)
 		if err != nil {
@@ -109,6 +149,7 @@ func getTemporaryEmail() (string, error) {
 
 	return "", fmt.Errorf("所有临时邮箱服务均失败: %v", lastErr)
 }
+
 func getEmailFromProvider(provider TempMailProvider) (string, error) {
 	req, _ := http.NewRequest("GET", provider.GenerateURL, nil)
 	for k, v := range provider.Headers {
@@ -141,8 +182,402 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 	return email, nil
 }
 
+// ==================== QQ邮箱IMAP读取 ====================
+
+// testQQImapConnection 测试QQ邮箱IMAP连接
+func testQQImapConnection() {
+	cfg := appConfig.Email.QQImap
+	if cfg.Address == "" || cfg.AuthCode == "" {
+		log.Println("❌ QQ邮箱IMAP未配置，请在 config.json 中配置 email.qq_imap")
+		return
+	}
+
+	server := cfg.Server
+	if server == "" {
+		server = "imap.qq.com"
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = 993
+	}
+
+	log.Println("🔧 测试QQ邮箱IMAP连接...")
+	log.Printf("   服务器: %s:%d", server, port)
+	log.Printf("   邮箱: %s", cfg.Address)
+
+	// 连接IMAP服务器
+	addr := fmt.Sprintf("%s:%d", server, port)
+	log.Println("📡 正在连接IMAP服务器...")
+
+	c, err := client.DialTLS(addr, &tls.Config{ServerName: server})
+	if err != nil {
+		log.Printf("❌ 连接IMAP服务器失败: %v", err)
+		return
+	}
+	defer c.Logout()
+	log.Println("✅ 连接成功")
+
+	// 登录
+	log.Println("🔐 正在登录...")
+	if err := c.Login(cfg.Address, cfg.AuthCode); err != nil {
+		log.Printf("❌ IMAP登录失败: %v", err)
+		log.Println("   请检查邮箱地址和授权码是否正确")
+		return
+	}
+	log.Println("✅ 登录成功")
+
+	// 选择收件箱
+	mbox, err := c.Select("INBOX", true)
+	if err != nil {
+		log.Printf("❌ 选择收件箱失败: %v", err)
+		return
+	}
+	log.Printf("✅ 收件箱打开成功，共 %d 封邮件", mbox.Messages)
+
+	if mbox.Messages == 0 {
+		log.Println("📭 收件箱为空")
+		return
+	}
+
+	// 获取最近5封邮件
+	from := uint32(1)
+	to := mbox.Messages
+	if mbox.Messages > 5 {
+		from = mbox.Messages - 4
+	}
+
+	log.Printf("📬 读取最近 %d 封邮件...", to-from+1)
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(from, to)
+
+	messages := make(chan *imap.Message, 10)
+	section := &imap.BodySectionName{}
+	items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Fetch(seqSet, items, messages)
+	}()
+
+	count := 0
+	for msg := range messages {
+		count++
+		if msg == nil || msg.Envelope == nil {
+			log.Printf("   邮件 %d: (无法读取)", count)
+			continue
+		}
+
+		subject := msg.Envelope.Subject
+		date := msg.Envelope.Date.Format("2006-01-02 15:04:05")
+		from := ""
+		if len(msg.Envelope.From) > 0 && msg.Envelope.From[0] != nil {
+			from = msg.Envelope.From[0].Address()
+		}
+		to := ""
+		if len(msg.Envelope.To) > 0 && msg.Envelope.To[0] != nil {
+			to = msg.Envelope.To[0].Address()
+		}
+
+		// 读取正文长度
+		bodyLen := 0
+		r := msg.GetBody(section)
+		if r != nil {
+			body, _ := io.ReadAll(r)
+			bodyLen = len(body)
+		}
+
+		log.Printf("   邮件 %d:", count)
+		log.Printf("      主题: %s", subject)
+		log.Printf("      发件人: %s", from)
+		log.Printf("      收件人: %s", to)
+		log.Printf("      时间: %s", date)
+		log.Printf("      正文长度: %d 字节", bodyLen)
+	}
+
+	if err := <-done; err != nil {
+		log.Printf("❌ 获取邮件失败: %v", err)
+		return
+	}
+
+	log.Println("✅ IMAP测试完成")
+}
+
+// getVerificationCodeFromQQMail 从QQ邮箱通过IMAP获取验证码
+// targetEmail: 注册用的邮箱地址（用于匹配收件人）
+// maxWait: 最大等待时间
+func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (string, error) {
+	cfg := appConfig.Email.QQImap
+	if cfg.Address == "" || cfg.AuthCode == "" {
+		return "", fmt.Errorf("QQ邮箱IMAP未配置")
+	}
+
+	server := cfg.Server
+	if server == "" {
+		server = "imap.qq.com"
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = 993
+	}
+
+	// 使用 UTC 时间，因为 IMAP 邮件时间通常是 UTC
+	startTime := time.Now().UTC()
+	checkInterval := 3 * time.Second // 3秒检查一次，更快
+	checkCount := 0
+
+	// 提取目标邮箱的用户名部分（用于在邮件正文中搜索）
+	targetUser := strings.Split(targetEmail, "@")[0]
+
+	log.Printf("📬 开始从QQ邮箱获取验证码，目标邮箱: %s (用户名: %s), 开始时间: %s UTC",
+		targetEmail, targetUser, startTime.Format("15:04:05"))
+
+	for time.Since(startTime) < maxWait {
+		checkCount++
+		// 传入开始时间，只接受这个时间之后的邮件
+		code, err := checkQQMailForCode(server, port, cfg.Address, cfg.AuthCode, targetEmail, startTime)
+		if err != nil {
+			log.Printf("⚠️ [检查 %d] QQ邮箱检查失败: %v", checkCount, err)
+		} else if code != "" {
+			log.Printf("✅ 从QQ邮箱获取到验证码: %s (耗时 %v)", code, time.Since(startTime))
+			return code, nil
+		} else {
+			if checkCount <= 3 || checkCount%6 == 0 {
+				log.Printf("⏳ [检查 %d] 未找到新验证码邮件，继续等待... (已等待 %v)", checkCount, time.Since(startTime).Round(time.Second))
+			}
+		}
+		time.Sleep(checkInterval)
+	}
+
+	return "", fmt.Errorf("等待验证码超时 (%v)，请检查：1.QQ邮箱是否收到Google邮件 2.邮件转发是否正常", maxWait)
+}
+
+// checkQQMailForCode 检查QQ邮箱中的验证码邮件
+// startTime: 只接受这个时间之后收到的邮件
+func checkQQMailForCode(server string, port int, email, authCode, targetEmail string, startTime time.Time) (string, error) {
+	// 连接IMAP服务器
+	addr := fmt.Sprintf("%s:%d", server, port)
+	c, err := client.DialTLS(addr, &tls.Config{ServerName: server})
+	if err != nil {
+		return "", fmt.Errorf("连接IMAP服务器失败: %w", err)
+	}
+	defer c.Logout()
+
+	// 登录
+	if err := c.Login(email, authCode); err != nil {
+		return "", fmt.Errorf("IMAP登录失败: %w", err)
+	}
+
+	// 检查连接状态 - 发送 NOOP 命令刷新状态
+	if err := c.Noop(); err != nil {
+		return "", fmt.Errorf("IMAP 状态刷新失败: %w", err)
+	}
+
+	// 选择收件箱（只读模式）
+	mbox, err := c.Select("INBOX", true)
+	if err != nil {
+		return "", fmt.Errorf("选择收件箱失败: %w", err)
+	}
+
+	log.Printf("📬 收件箱共 %d 封邮件 (最近: %d, 未读: %d)", mbox.Messages, mbox.Recent, mbox.Unseen)
+
+	if mbox.Messages == 0 {
+		return "", nil // 没有邮件
+	}
+
+	// 搜索最近的邮件（最近20封）
+	from := uint32(1)
+	to := mbox.Messages
+	if mbox.Messages > 20 {
+		from = mbox.Messages - 19
+	}
+
+	log.Printf("📬 收件箱共 %d 封邮件，检查第 %d-%d 封", mbox.Messages, from, to)
+
+	seqSet := new(imap.SeqSet)
+	seqSet.AddRange(from, to)
+
+	// 获取邮件（包含完整头部信息）
+	messages := make(chan *imap.Message, 20)
+	section := &imap.BodySectionName{}
+	headerSection := &imap.BodySectionName{Peek: true}
+	headerSection.Specifier = imap.HeaderSpecifier
+	
+	items := []imap.FetchItem{
+		section.FetchItem(),
+		imap.FetchEnvelope,
+		headerSection.FetchItem(), // 获取完整邮件头
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Fetch(seqSet, items, messages)
+	}()
+
+	// 提取目标邮箱的用户名部分（用于在邮件正文中搜索）
+	targetUser := strings.Split(targetEmail, "@")[0]
+	checkedCount := 0
+	googleMailCount := 0
+
+	// 检查每封邮件
+	for msg := range messages {
+		if msg == nil {
+			continue
+		}
+		checkedCount++
+
+		if msg.Envelope == nil {
+			log.Printf("⚠️ 邮件 %d: Envelope 为空", checkedCount)
+			continue
+		}
+
+		subject := msg.Envelope.Subject
+		// 将邮件时间转换为 UTC，确保与 startTime 时区一致
+		msgDate := msg.Envelope.Date.UTC()
+
+		// 获取发件人
+		fromAddr := ""
+		if len(msg.Envelope.From) > 0 && msg.Envelope.From[0] != nil {
+			fromAddr = msg.Envelope.From[0].Address()
+		}
+
+		// 获取收件人列表
+		toAddrs := []string{}
+		for _, addr := range msg.Envelope.To {
+			if addr != nil {
+				toAddrs = append(toAddrs, addr.Address())
+			}
+		}
+
+		// 读取邮件头，查找原始收件人（转发邮件）
+		headerSection := &imap.BodySectionName{Peek: true}
+		headerSection.Specifier = imap.HeaderSpecifier
+		headerReader := msg.GetBody(headerSection)
+		originalRecipients := []string{}
+		if headerReader != nil {
+			headerBytes, _ := io.ReadAll(headerReader)
+			headerStr := string(headerBytes)
+			
+			// 查找可能包含原始收件人的字段
+			for _, line := range strings.Split(headerStr, "\n") {
+				line = strings.TrimSpace(line)
+				// X-Forwarded-To, Delivered-To, X-Original-To 等
+				if strings.HasPrefix(line, "X-Forwarded-To:") ||
+					strings.HasPrefix(line, "Delivered-To:") ||
+					strings.HasPrefix(line, "X-Original-To:") {
+					addr := strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+					originalRecipients = append(originalRecipients, addr)
+				}
+			}
+		}
+
+		// 先打印所有邮件信息用于调试
+		log.Printf("🔍 邮件 %d: 主题='%s', 发件人='%s', 时间=%v UTC",
+			checkedCount, subject, fromAddr, msgDate.Format("15:04:05"))
+		log.Printf("   收件人: %v, 原始收件人: %v", toAddrs, originalRecipients)
+
+		// 关键修改：只处理在 startTime 之后收到的邮件（允许30秒误差）
+		// 这样可以避免读取旧的验证码邮件
+		if msgDate.Before(startTime.Add(-30 * time.Second)) {
+			log.Printf("   ⏭️ 跳过：邮件时间 %v 早于开始时间 %v",
+				msgDate.Format("15:04:05"), startTime.Format("15:04:05"))
+			continue
+		}
+
+		// 读取邮件正文
+		r := msg.GetBody(section)
+		if r == nil {
+			log.Printf("⚠️ 邮件 %d: 无法获取正文, 主题=%s", checkedCount, subject)
+			continue
+		}
+
+		body, err := io.ReadAll(r)
+		if err != nil {
+			log.Printf("⚠️ 邮件 %d: 读取正文失败: %v", checkedCount, err)
+			continue
+		}
+		bodyStr := string(body)
+
+		// 检查是否是Google的验证邮件（放宽条件）
+		isGoogleMail := strings.Contains(subject, "验证") || strings.Contains(subject, "Verify") ||
+			strings.Contains(subject, "code") || strings.Contains(subject, "Code") ||
+			strings.Contains(subject, "Google") || strings.Contains(subject, "google") ||
+			strings.Contains(bodyStr, "Google") || strings.Contains(bodyStr, "验证码") ||
+			strings.Contains(fromAddr, "google")
+
+		if !isGoogleMail {
+			continue
+		}
+
+		googleMailCount++
+		log.Printf("📧 [Google邮件 %d] 主题: %s, 发件人: %s, 时间: %v",
+			googleMailCount, subject, fromAddr, msgDate.Format("15:04:05"))
+
+		// 检查邮件是否与目标邮箱相关
+		toMatched := false
+		// 检查常规收件人
+		for _, addr := range toAddrs {
+			if strings.EqualFold(addr, targetEmail) {
+				toMatched = true
+				break
+			}
+		}
+		// 检查原始收件人（转发邮件）
+		originalMatched := false
+		for _, addr := range originalRecipients {
+			if strings.Contains(addr, targetEmail) || strings.Contains(addr, targetUser) {
+				originalMatched = true
+				break
+			}
+		}
+		
+		// 检查正文是否包含目标邮箱地址或用户名
+		bodyContainsTarget := strings.Contains(bodyStr, targetEmail) || strings.Contains(bodyStr, targetUser)
+
+		// 匹配条件：收件人匹配 或 原始收件人匹配 或 正文包含目标
+		isTargetMail := toMatched || originalMatched || bodyContainsTarget
+		
+		log.Printf("   收件人匹配=%v, 原始收件人匹配=%v, 正文包含目标=%v, 最终匹配=%v",
+			toMatched, originalMatched, bodyContainsTarget, isTargetMail)
+
+		// 从邮件内容中提取验证码
+		code, err := extractVerificationCode(bodyStr)
+		if err == nil && code != "" {
+			log.Printf("✅ 从邮件正文提取到验证码: %s", code)
+			return code, nil
+		}
+
+		// 也尝试从主题中提取
+		code, err = extractVerificationCode(subject)
+		if err == nil && code != "" {
+			log.Printf("✅ 从邮件主题提取到验证码: %s", code)
+			return code, nil
+		}
+
+		// 打印正文前200字符用于调试
+		preview := bodyStr
+		if len(preview) > 300 {
+			preview = preview[:300]
+		}
+		log.Printf("   正文预览: %s...", strings.ReplaceAll(preview, "\n", " "))
+	}
+
+	// 检查 fetch 是否有错误
+	if err := <-done; err != nil {
+		return "", fmt.Errorf("获取邮件失败: %w", err)
+	}
+
+	log.Printf("📊 共检查 %d 封邮件，其中 %d 封是Google邮件", checkedCount, googleMailCount)
+	return "", nil // 未找到验证码
+}
+
 // getEmailCount 获取当前邮件数量
 func getEmailCount(email string) int {
+	// 如果使用QQ邮箱，不需要计数
+	if isQQImapConfigured() {
+		return 0
+	}
+
 	req, _ := http.NewRequest("GET", fmt.Sprintf("https://mail.chatgpt.org.uk/api/emails?email=%s", email), nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
 	req.Header.Set("Referer", "https://mail.chatgpt.org.uk")
@@ -159,6 +594,26 @@ func getEmailCount(email string) int {
 		return 0
 	}
 	return len(result.Data.Emails)
+}
+
+// getVerificationCode 统一的验证码获取函数
+// 优先使用QQ邮箱IMAP，回退到临时邮箱API
+func getVerificationCode(targetEmail string, maxWait time.Duration) (string, error) {
+	// 优先使用QQ邮箱IMAP
+	if isQQImapConfigured() {
+		return getVerificationCodeFromQQMail(targetEmail, maxWait)
+	}
+
+	// 回退到临时邮箱API
+	retries := int(maxWait.Seconds() / 3)
+	if retries < 1 {
+		retries = 1
+	}
+	emailContent, err := getVerificationEmailQuick(targetEmail, retries, 3)
+	if err != nil {
+		return "", err
+	}
+	return extractVerificationCode(emailContent.Content)
 }
 
 func getVerificationEmailQuick(email string, retries int, intervalSec int) (*EmailContent, error) {
@@ -202,30 +657,153 @@ func getVerificationEmailAfter(email string, retries int, intervalSec int, initi
 }
 
 func extractVerificationCode(content string) (string, error) {
-	re := regexp.MustCompile(`\b[A-Z0-9]{6}\b`)
-	matches := re.FindAllString(content, -1)
+	// 先尝试解析 MIME 内容
+	decodedContent := decodeMimeContent(content)
 
-	for _, code := range matches {
+	// Google 验证码格式通常是: G-XXXXXX 或纯6位字母数字
+	// 优先匹配 G- 开头的格式
+	reGoogle := regexp.MustCompile(`G-([A-Z0-9]{6})`)
+	if m := reGoogle.FindStringSubmatch(decodedContent); len(m) > 1 {
+		return m[1], nil
+	}
+
+	// 匹配6位大写字母数字组合（必须包含字母和数字）
+	re := regexp.MustCompile(`\b([A-Z0-9]{6})\b`)
+	matches := re.FindAllStringSubmatch(decodedContent, -1)
+
+	for _, match := range matches {
+		code := match[1]
 		if commonWords[code] {
 			continue
 		}
-		if regexp.MustCompile(`[0-9]`).MatchString(code) {
+		// 验证码应该同时包含字母和数字
+		hasLetter := regexp.MustCompile(`[A-Z]`).MatchString(code)
+		hasDigit := regexp.MustCompile(`[0-9]`).MatchString(code)
+		if hasLetter && hasDigit {
 			return code, nil
 		}
 	}
 
-	for _, code := range matches {
-		if !commonWords[code] {
-			return code, nil
+	// 如果没有找到字母数字混合的，尝试只有数字的（但排除常见的无效模式）
+	for _, match := range matches {
+		code := match[1]
+		if commonWords[code] {
+			continue
 		}
+		// 排除全是相同数字的情况（如 333333, 000000）
+		if isAllSameChar(code) {
+			continue
+		}
+		// 排除看起来像日期/时间的（如 202312, 143052）
+		if looksLikeDateTime(code) {
+			continue
+		}
+		return code, nil
 	}
 
-	re2 := regexp.MustCompile(`(?i)code\s*[:is]\s*([A-Z0-9]{6})`)
-	if m := re2.FindStringSubmatch(content); len(m) > 1 {
+	// 最后尝试从 "code is" 或 "验证码" 附近提取
+	re2 := regexp.MustCompile(`(?i)(?:code|验证码)\s*[:is：]\s*([A-Z0-9]{6})`)
+	if m := re2.FindStringSubmatch(decodedContent); len(m) > 1 {
 		return m[1], nil
 	}
 
 	return "", fmt.Errorf("无法从邮件中提取验证码")
+}
+
+// decodeMimeContent 解码 MIME 邮件内容
+func decodeMimeContent(content string) string {
+	result := content
+
+	// 尝试解码 Base64 内容
+	if strings.Contains(content, "Content-Transfer-Encoding: base64") ||
+		strings.Contains(content, "content-transfer-encoding: base64") {
+		// 查找 Base64 编码的部分
+		lines := strings.Split(content, "\n")
+		var base64Content strings.Builder
+		inBase64 := false
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" && inBase64 {
+				continue
+			}
+			if strings.HasPrefix(line, "Content-") || strings.HasPrefix(line, "content-") {
+				if strings.Contains(strings.ToLower(line), "base64") {
+					inBase64 = true
+				}
+				continue
+			}
+			if inBase64 && line != "" && !strings.Contains(line, ":") && !strings.HasPrefix(line, "--") {
+				base64Content.WriteString(line)
+			}
+		}
+		if base64Content.Len() > 0 {
+			if decoded, err := base64.StdEncoding.DecodeString(base64Content.String()); err == nil {
+				result = string(decoded)
+			}
+		}
+	}
+
+	// 尝试解码 Quoted-Printable 内容
+	if strings.Contains(content, "Content-Transfer-Encoding: quoted-printable") ||
+		strings.Contains(content, "content-transfer-encoding: quoted-printable") {
+		// 查找并解码 QP 内容
+		reader := quotedprintable.NewReader(strings.NewReader(content))
+		if decoded, err := io.ReadAll(reader); err == nil && len(decoded) > 0 {
+			result = string(decoded)
+		}
+	}
+
+	// 解码 MIME 编码的主题/内容 (=?UTF-8?B?...?= 或 =?UTF-8?Q?...?=)
+	dec := new(mime.WordDecoder)
+	if decoded, err := dec.DecodeHeader(result); err == nil {
+		result = decoded
+	}
+
+	// 移除 HTML 标签，提取纯文本
+	result = stripHTMLTags(result)
+
+	return result
+}
+
+// stripHTMLTags 移除 HTML 标签
+func stripHTMLTags(s string) string {
+	re := regexp.MustCompile(`<[^>]*>`)
+	return re.ReplaceAllString(s, " ")
+}
+
+// isAllSameChar 检查是否全是相同字符
+func isAllSameChar(s string) bool {
+	if len(s) == 0 {
+		return true
+	}
+	first := s[0]
+	for i := 1; i < len(s); i++ {
+		if s[i] != first {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeDateTime 检查是否看起来像日期时间
+func looksLikeDateTime(s string) bool {
+	// 检查是否像年月日 (202312) 或时分秒 (143052)
+	if len(s) != 6 {
+		return false
+	}
+	// 检查前4位是否像年份 (2020-2030)
+	if s[:4] >= "2020" && s[:4] <= "2030" {
+		return true
+	}
+	// 检查是否像时间格式
+	hour := s[:2]
+	min := s[2:4]
+	sec := s[4:6]
+	if hour >= "00" && hour <= "23" && min >= "00" && min <= "59" && sec >= "00" && sec <= "59" {
+		// 可能是时间，但不一定
+		return false // 不排除，因为验证码也可能是这种格式
+	}
+	return false
 }
 func safeType(page *rod.Page, text string, delay int) error {
 	for _, char := range text {
@@ -628,50 +1206,59 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	// 处理验证码
 	if needsVerification {
-
-		var emailContent *EmailContent
 		maxWaitTime := 3 * time.Minute
-		startTime := time.Now()
-		clickCount := 0
+		var code string
+		var codeErr error
 
-		for time.Since(startTime) < maxWaitTime {
-			// 尝试点击重发按钮
-			clickResult, _ := page.Eval(`() => {
-				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
-				const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
-				            document.querySelector('span.YuMlnb-vQzf8d');
-				
-				if (btn && btn.textContent.includes('重新发送')) {
-					btn.click();
-					if (btn.parentElement) btn.parentElement.click();
-					return {clicked: true};
+		// 使用统一的验证码获取函数
+		if isQQImapConfigured() {
+			// QQ邮箱方案：直接获取验证码
+			log.Printf("[注册 %d] 使用QQ邮箱IMAP获取验证码...", threadID)
+			code, codeErr = getVerificationCode(email, maxWaitTime)
+		} else {
+			// 临时邮箱方案：原有逻辑
+			var emailContent *EmailContent
+			startTime := time.Now()
+
+			for time.Since(startTime) < maxWaitTime {
+				// 尝试点击重发按钮
+				clickResult, _ := page.Eval(`() => {
+					// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
+					const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
+					            document.querySelector('span.YuMlnb-vQzf8d');
+					
+					if (btn && btn.textContent.includes('重新发送')) {
+						btn.click();
+						if (btn.parentElement) btn.parentElement.click();
+						return {clicked: true};
+					}
+					return {clicked: false};
+				}`)
+
+				if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
+					time.Sleep(1 * time.Second)
 				}
-				return {clicked: false};
-			}`)
 
-			if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
-				clickCount++
-				time.Sleep(1 * time.Second)
+				// 快速检查邮件
+				emailContent, _ = getVerificationEmailQuick(email, 1, 1)
+				if emailContent != nil {
+					break
+				}
 			}
 
-			// 快速检查邮件
-			emailContent, _ = getVerificationEmailQuick(email, 1, 1)
-			if emailContent != nil {
-				break
+			if emailContent == nil {
+				codeErr = fmt.Errorf("无法获取验证码邮件")
+			} else {
+				code, codeErr = extractVerificationCode(emailContent.Content)
 			}
 		}
 
-		if emailContent == nil {
-			result.Error = fmt.Errorf("无法获取验证码邮件")
+		if codeErr != nil {
+			result.Error = codeErr
 			return result
 		}
 
-		// 提取验证码
-		code, err := extractVerificationCode(emailContent.Content)
-		if err != nil {
-			result.Error = err
-			return result
-		}
+		log.Printf("[注册 %d] 获取到验证码: %s", threadID, code)
 
 		// 等待验证码输入框
 		time.Sleep(500 * time.Millisecond)
@@ -821,9 +1408,10 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 等待更多可能的跳转
 	time.Sleep(3 * time.Second)
 	
-	// 尝试多次点击可能出现的额外按钮
-	for i := 0; i < 15; i++ {
-		time.Sleep(2 * time.Second)
+	// 尝试多次点击可能出现的额外按钮，并等待获取 Authorization
+	// 增加到 25 次，每次等待 3 秒
+	for i := 0; i < 25; i++ {
+		time.Sleep(3 * time.Second)
 
 		// 尝试点击可能出现的额外按钮
 		page.Eval(`() => {
@@ -856,31 +1444,52 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			}
 		}
 
+		// 每 5 次尝试打印一次状态
+		if (i+1)%5 == 0 {
+			if authorization == "" {
+				log.Printf("[注册 %d] ⏳ 等待 Authorization... (%d/25)", threadID, i+1)
+			}
+		}
+
 		if authorization != "" {
+			log.Printf("[注册 %d] ✅ 已获取到 Authorization (第 %d 次检查)", threadID, i+1)
 			break
 		}
 	}
 	
 	// 增强的 Authorization 获取逻辑
 	if authorization == "" {
-		log.Printf("[注册 %d] 仍未获取到 Authorization，尝试更多方法...", threadID)
+		log.Printf("[注册 %d] ⚠️ 仍未获取到 Authorization，尝试主动触发网络请求...", threadID)
 		
-		// 尝试刷新页面
-		page.Reload()
+		// 尝试导航到主页，触发认证请求
+		page.Navigate("https://business.gemini.google/app")
 		page.WaitLoad()
-		time.Sleep(3 * time.Second)
+		time.Sleep(5 * time.Second)
+		
+		// 如果还没有，尝试刷新页面
+		if authorization == "" {
+			log.Printf("[注册 %d] 尝试刷新页面...", threadID)
+			page.Reload()
+			page.WaitLoad()
+			time.Sleep(5 * time.Second)
+		}
 		
 		// 尝试从 localStorage 获取
 		localStorageAuth, _ := page.Eval(`() => {
-			return localStorage.getItem('Authorization') || 
+			const auth = localStorage.getItem('Authorization') || 
 				   localStorage.getItem('authorization') ||
 				   localStorage.getItem('auth_token') ||
 				   localStorage.getItem('token');
+			return auth || ''; // 确保返回字符串而不是 null
 		}`)
 		
-		if localStorageAuth != nil && localStorageAuth.Value.String() != "" {
-			authorization = localStorageAuth.Value.String()
-			log.Printf("[注册 %d] 从 localStorage 获取 Authorization", threadID)
+		if localStorageAuth != nil {
+			authStr := localStorageAuth.Value.String()
+			// 过滤掉 nil, null, undefined 等无效值
+			if authStr != "" && authStr != "<nil>" && authStr != "null" && authStr != "undefined" {
+				authorization = authStr
+				log.Printf("[注册 %d] 从 localStorage 获取 Authorization", threadID)
+			}
 		}
 		
 		// 从页面源代码中提取
@@ -951,6 +1560,14 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}
 
 	log.Printf("[注册 %d] 获取到 %d 个 Cookie", threadID, len(resultCookies))
+
+	// 检查 Authorization 是否有效
+	if authorization == "" || authorization == "<nil>" || authorization == "null" {
+		log.Printf("[注册 %d] ⚠️ Authorization 无效或为空，账号可能无法正常使用", threadID)
+		authorization = "" // 清空无效值
+	} else {
+		log.Printf("[注册 %d] ✅ 已获取有效 Authorization", threadID)
+	}
 
 	result.Success = true
 	result.Authorization = authorization
@@ -1217,29 +1834,47 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 			initialEmailCount = getEmailCount(email)
 		}
 
-		var emailContent *EmailContent
+		var code string
+		var codeErr error
 		maxWaitTime := 3 * time.Minute
-		startTime := time.Now()
 
-		for time.Since(startTime) < maxWaitTime {
-			// 快速检查新邮件（只接受数量增加的情况）
-			emailContent, _ = getVerificationEmailAfter(email, 1, 1, initialEmailCount)
-			if emailContent != nil {
-				break
+		// 判断是否使用QQ邮箱（检查邮箱域名是否匹配配置的注册域名）
+		useQQImap := isQQImapConfigured() && strings.HasSuffix(email, "@"+appConfig.Email.RegisterDomain)
+
+		if useQQImap {
+			// QQ邮箱方案
+			log.Printf("[Cookie刷新] [%s] 使用QQ邮箱IMAP获取验证码...", email)
+			code, codeErr = getVerificationCode(email, maxWaitTime)
+		} else {
+			// 临时邮箱方案
+			var emailContent *EmailContent
+			startTime := time.Now()
+
+			for time.Since(startTime) < maxWaitTime {
+				// 快速检查新邮件（只接受数量增加的情况）
+				emailContent, _ = getVerificationEmailAfter(email, 1, 1, initialEmailCount)
+				if emailContent != nil {
+					break
+				}
+				time.Sleep(2 * time.Second)
 			}
-			time.Sleep(2 * time.Second)
+
+			if emailContent == nil {
+				codeErr = fmt.Errorf("无法获取验证码邮件")
+			} else {
+				code, codeErr = extractVerificationCode(emailContent.Content)
+			}
 		}
 
-		if emailContent == nil {
-			result.Error = fmt.Errorf("无法获取验证码邮件")
-			return result
-		}
-
-		// 提取验证码
-		code, err := extractVerificationCode(emailContent.Content)
-		if err != nil {
+		if codeErr != nil {
+			if codeRetry == maxCodeRetries-1 {
+				result.Error = codeErr
+				return result
+			}
 			continue // 重试
 		}
+
+		log.Printf("[Cookie刷新] [%s] 获取到验证码: %s", email, code)
 
 		// 输入验证码
 		time.Sleep(500 * time.Millisecond)

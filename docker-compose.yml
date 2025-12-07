@@ -2,9 +2,9 @@ version: '3.8'
 
 services:
   business2api:
-    image: ghcr.io/XxxXTeam/business2api:latest
-    # 或本地构建: docker compose build
-    # build: .
+    # image: ghcr.io/XxxXTeam/business2api:latest
+    # 本地构建
+    build: .
     container_name: business2api
     restart: unless-stopped
     ports:

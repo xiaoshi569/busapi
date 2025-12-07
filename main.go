@@ -43,13 +43,28 @@ type PoolConfig struct {
 	BrowserRefreshMaxRetry int  `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
 }
 
+// QQ邮箱IMAP配置
+type QQImapConfig struct {
+	Server   string `json:"server"`    // IMAP服务器地址
+	Port     int    `json:"port"`      // IMAP端口
+	Address  string `json:"address"`   // QQ邮箱地址
+	AuthCode string `json:"auth_code"` // QQ邮箱授权码
+}
+
+// 邮箱配置
+type EmailConfig struct {
+	RegisterDomain string       `json:"register_domain"` // 注册用邮箱域名
+	QQImap         QQImapConfig `json:"qq_imap"`         // QQ邮箱IMAP配置
+}
+
 type AppConfig struct {
-	APIKeys       []string   `json:"api_keys"`       // API 密钥列表
-	ListenAddr    string     `json:"listen_addr"`    // 监听地址
-	DataDir       string     `json:"data_dir"`       // 数据目录
-	Pool          PoolConfig `json:"pool"`           // 号池配置
-	Proxy         string     `json:"proxy"`          // 代理
-	DefaultConfig string     `json:"default_config"` // 默认 configId
+	APIKeys       []string    `json:"api_keys"`       // API 密钥列表
+	ListenAddr    string      `json:"listen_addr"`    // 监听地址
+	DataDir       string      `json:"data_dir"`       // 数据目录
+	Pool          PoolConfig  `json:"pool"`           // 号池配置
+	Proxy         string      `json:"proxy"`          // 代理
+	DefaultConfig string      `json:"default_config"` // 默认 configId
+	Email         EmailConfig `json:"email"`          // 邮箱配置
 }
 
 var appConfig = AppConfig{
@@ -68,6 +83,13 @@ var appConfig = AppConfig{
 		EnableBrowserRefresh:   true, // 默认启用浏览器刷新
 		BrowserRefreshHeadless: true,
 		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
+	},
+	Email: EmailConfig{
+		RegisterDomain: "", // 需要配置
+		QQImap: QQImapConfig{
+			Server: "imap.qq.com",
+			Port:   993,
+		},
 	},
 }
 
@@ -1866,6 +1888,7 @@ func main() {
 
 	var refreshEmail string
 	var refreshMode bool
+	var testImapMode bool
 
 	// 解析命令行参数
 	for i, arg := range os.Args[1:] {
@@ -1882,6 +1905,8 @@ func main() {
 			if i+2 < len(os.Args) && !strings.HasPrefix(os.Args[i+2], "-") {
 				refreshEmail = os.Args[i+2]
 			}
+		case "--test-imap":
+			testImapMode = true
 		case "--help", "-h":
 			fmt.Println(`用法: ./gemini-gateway [选项]
 
@@ -1889,9 +1914,17 @@ func main() {
   --debug, -d           调试模式，保存注册过程截图
   --once                单次注册模式（调试用）
   --refresh [email]     有头浏览器刷新账号（不指定email则使用第一个账号）
+  --test-imap           测试QQ邮箱IMAP连接
   --help, -h            显示帮助`)
 			os.Exit(0)
 		}
+	}
+
+	// 测试 IMAP 模式
+	if testImapMode {
+		loadAppConfig()
+		testQQImapConnection()
+		return
 	}
 
 	// 刷新模式：直接执行浏览器刷新后退出

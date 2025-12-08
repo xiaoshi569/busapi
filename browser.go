@@ -1087,7 +1087,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
 	}
 
-	// 设置启动参数（兼容更多环境）
+	// 设置启动参数（兼容更多环境 + 增强反检测）
 	l = l.Headless(headless).
 		Set("no-sandbox").
 		Set("disable-setuid-sandbox").
@@ -1097,7 +1097,10 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		Set("disable-blink-features", "AutomationControlled").
 		Set("window-size", "1280,800").
 		Set("lang", "zh-CN").
-		Set("disable-extensions")
+		Set("disable-extensions").
+		Set("exclude-switches", "enable-automation").
+		Set("disable-infobars").
+		Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 	if proxy != "" {
 		l = l.Proxy(proxy)
@@ -1130,8 +1133,42 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	// 设置视口和 User-Agent
 	page.MustSetViewport(1280, 800, 1, false)
 	page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
-		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 	})
+
+	// 增强的反检测脚本
+	page.Eval(`() => {
+		// 删除 webdriver 标识
+		Object.defineProperty(navigator, 'webdriver', {
+			get: () => undefined
+		});
+		
+		// 修复 Chrome 对象
+		window.chrome = {
+			runtime: {},
+			loadTimes: function() {},
+			csi: function() {},
+			app: {}
+		};
+		
+		// 修复 Permissions API
+		const originalQuery = window.navigator.permissions.query;
+		window.navigator.permissions.query = (parameters) => (
+			parameters.name === 'notifications' ?
+				Promise.resolve({ state: Notification.permission }) :
+				originalQuery(parameters)
+		);
+		
+		// 修复 plugins
+		Object.defineProperty(navigator, 'plugins', {
+			get: () => [1, 2, 3, 4, 5]
+		});
+		
+		// 修复 languages
+		Object.defineProperty(navigator, 'languages', {
+			get: () => ['zh-CN', 'zh', 'en']
+		});
+	}`)
 
 	// 监听请求以捕获 authorization
 	var authorization string
@@ -1186,8 +1223,53 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}`)
 	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "03_before_submit")
-	emailSubmitted := false
-	for i := 0; i < 8; i++ {
+	
+	log.Printf("[注册 %d] 等待页面自动跳转或准备提交...", threadID)
+	
+	// 提前声明变量（避免 goto 跳过声明）
+	var emailSubmitted bool
+	var alreadyOnVerificationPage *proto.RuntimeRemoteObject
+	
+	// 策略1: 先等待3秒，检查是否自动跳转
+	time.Sleep(3 * time.Second)
+	
+	// 检查是否已经跳转到验证码页面
+	alreadyOnVerificationPage, _ = page.Eval(`() => {
+		const pageText = document.body ? document.body.textContent : '';
+		return pageText.includes('验证') || pageText.includes('Verify') || 
+		       pageText.includes('code') || pageText.includes('sent') ||
+		       pageText.includes('姓氏') || pageText.includes('名字') || 
+		       pageText.includes('Full name') || pageText.includes('全名');
+	}`)
+	
+	if alreadyOnVerificationPage != nil && alreadyOnVerificationPage.Value.Bool() {
+		log.Printf("[注册 %d] ✅ 页面已自动跳转", threadID)
+		goto afterEmailSubmit
+	}
+	
+	// 策略2: 按 Enter 键提交
+	log.Printf("[注册 %d] 尝试按 Enter 键提交", threadID)
+	page.Keyboard.Press(input.Enter)
+	time.Sleep(2 * time.Second)
+	
+	// 再次检查是否跳转
+	alreadyOnVerificationPage, _ = page.Eval(`() => {
+		const pageText = document.body ? document.body.textContent : '';
+		return pageText.includes('验证') || pageText.includes('Verify') || 
+		       pageText.includes('code') || pageText.includes('sent') ||
+		       pageText.includes('姓氏') || pageText.includes('名字') || 
+		       pageText.includes('Full name') || pageText.includes('全名');
+	}`)
+	
+	if alreadyOnVerificationPage != nil && alreadyOnVerificationPage.Value.Bool() {
+		log.Printf("[注册 %d] ✅ Enter 键提交成功", threadID)
+		goto afterEmailSubmit
+	}
+	
+	// 策略3: 尝试查找并点击按钮（兜底）
+	log.Printf("[注册 %d] 尝试查找提交按钮", threadID)
+	emailSubmitted = false
+	for i := 0; i < 5; i++ {
 		clickResult, _ := page.Eval(`() => {
 			if (!document.body) return { clicked: false, reason: 'body_null' };
 			
@@ -1216,41 +1298,65 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 		if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
 			emailSubmitted = true
+			log.Printf("[注册 %d] ✅ 找到并点击了提交按钮", threadID)
 			break
 		}
-		log.Printf("[注册 %d] 尝试 %d/8: 未找到按钮", threadID, i+1)
 		time.Sleep(1 * time.Second)
 	}
+	
+	// 策略4: 即使没找到按钮，也检查页面状态，不要立即报错
 	if !emailSubmitted {
-		result.Error = fmt.Errorf("找不到提交按钮")
-		return result
+		log.Printf("[注册 %d] ⚠️ 未找到提交按钮，检查页面状态...", threadID)
+		time.Sleep(2 * time.Second)
+		
+		// 最后检查是否在正确页面
+		alreadyOnVerificationPage, _ = page.Eval(`() => {
+			const pageText = document.body ? document.body.textContent : '';
+			return pageText.includes('验证') || pageText.includes('Verify') || 
+			       pageText.includes('code') || pageText.includes('sent') ||
+			       pageText.includes('姓氏') || pageText.includes('名字') || 
+			       pageText.includes('Full name') || pageText.includes('全名');
+		}`)
+		
+		if alreadyOnVerificationPage == nil || !alreadyOnVerificationPage.Value.Bool() {
+			result.Error = fmt.Errorf("无法提交邮箱：页面未跳转且找不到提交按钮")
+			return result
+		}
+		log.Printf("[注册 %d] ✅ 页面已在正确状态，继续流程", threadID)
 	}
+	
+afterEmailSubmit:
 	time.Sleep(2 * time.Second)
 	debugScreenshot(page, threadID, "04_after_submit")
 	var needsVerification bool
 	checkResult, _ := page.Eval(`() => {
 		const pageText = document.body ? document.body.textContent : '';
 		
-		// 检查常见错误
-		if (pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
-			pageText.includes('无法创建') || pageText.includes('cannot create') ||
-			pageText.includes('不安全') || pageText.includes('secure') ||
-			pageText.includes('电话') || pageText.includes('Phone') || pageText.includes('number')) {
-			return { error: true, text: document.body.innerText.substring(0, 100) };
-		}
-
-		// 检查是否需要验证码
-		if (pageText.includes('验证') || pageText.includes('Verify') || 
-			pageText.includes('code') || pageText.includes('sent')) {
+		// 先检查是否是验证码页面（正常流程）
+		const isVerificationPage = pageText.includes('验证码') || pageText.includes('verification code') ||
+			pageText.includes('请输入验证码') || pageText.includes('已发送') || pageText.includes('sent');
+		
+		// 检查是否是姓名页面（正常流程）
+		const isNamePage = pageText.includes('姓氏') || pageText.includes('名字') || 
+			pageText.includes('Full name') || pageText.includes('全名');
+		
+		// 如果是正常的验证码或姓名页面，不要检查错误
+		if (isVerificationPage) {
 			return { needsVerification: true, isNamePage: false };
 		}
-		
-		// 检查是否已经到了姓名页面
-		if (pageText.includes('姓氏') || pageText.includes('名字') || 
-			pageText.includes('Full name') || pageText.includes('全名')) {
+		if (isNamePage) {
 			return { needsVerification: false, isNamePage: true };
 		}
 		
+		// 只有在非正常页面时才检查错误关键词
+		if (pageText.includes('出了点问题') || pageText.includes('Something went wrong') ||
+			pageText.includes('无法创建') || pageText.includes('cannot create') ||
+			pageText.includes('不安全的') || pageText.includes('not secure') ||
+			pageText.includes('需要电话号码') || pageText.includes('phone number required')) {
+			return { error: true, text: document.body.innerText.substring(0, 100) };
+		}
+		
+		// 默认需要验证码
 		return { needsVerification: true, isNamePage: false };
 	}`)
 
@@ -1716,8 +1822,14 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		Set("disable-setuid-sandbox").
 		Set("disable-dev-shm-usage").
 		Set("disable-gpu").
+		Set("disable-software-rasterizer").
 		Set("disable-blink-features", "AutomationControlled").
-		Set("window-size", "1280,800")
+		Set("window-size", "1280,800").
+		Set("lang", "zh-CN").
+		Set("disable-extensions").
+		Set("exclude-switches", "enable-automation").
+		Set("disable-infobars").
+		Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 	if proxy != "" {
 		l = l.Proxy(proxy)
@@ -1748,8 +1860,42 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 
 	page.MustSetViewport(1280, 800, 1, false)
 	page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
-		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		UserAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 	})
+
+	// 增强的反检测脚本
+	page.Eval(`() => {
+		// 删除 webdriver 标识
+		Object.defineProperty(navigator, 'webdriver', {
+			get: () => undefined
+		});
+		
+		// 修复 Chrome 对象
+		window.chrome = {
+			runtime: {},
+			loadTimes: function() {},
+			csi: function() {},
+			app: {}
+		};
+		
+		// 修复 Permissions API
+		const originalQuery = window.navigator.permissions.query;
+		window.navigator.permissions.query = (parameters) => (
+			parameters.name === 'notifications' ?
+				Promise.resolve({ state: Notification.permission }) :
+				originalQuery(parameters)
+		);
+		
+		// 修复 plugins
+		Object.defineProperty(navigator, 'plugins', {
+			get: () => [1, 2, 3, 4, 5]
+		});
+		
+		// 修复 languages
+		Object.defineProperty(navigator, 'languages', {
+			get: () => ['zh-CN', 'zh', 'en']
+		});
+	}`)
 
 	// 监听请求和响应以捕获 authorization 和响应头
 	var authorization string
@@ -2121,3 +2267,4 @@ func NativeRegisterWorker(id int, dataDirAbs string) {
 	}
 	log.Printf("[注册线程 %d] 停止", id)
 }
+

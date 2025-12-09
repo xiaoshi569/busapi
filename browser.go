@@ -1340,11 +1340,8 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 	}`)
 	time.Sleep(200 * time.Millisecond)
-	log.Printf("⌨️ [注册 %d] 开始输入邮箱（每个字符延迟15ms）...", threadID)
 	safeType(page, email, 15)
-	log.Printf("✅ [注册 %d] 邮箱输入完成", threadID)
 	time.Sleep(500 * time.Millisecond)
-	debugScreenshot(page, threadID, "02_email_input")
 
 	// 触发 blur
 	page.Eval(`() => {
@@ -1354,16 +1351,12 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 	}`)
 	time.Sleep(500 * time.Millisecond)
-	debugScreenshot(page, threadID, "03_before_submit")
-
-	log.Printf("[注册 %d] 等待页面自动跳转或准备提交...", threadID)
 
 	// 提前声明变量（避免 goto 跳过声明）
 	var emailSubmitted bool
 	var alreadyOnVerificationPage *proto.RuntimeRemoteObject
 
 	// 策略1: 先等待3秒，检查是否自动跳转
-	log.Printf("⏳ [注册 %d] 等待 3 秒，观察页面是否自动跳转...", threadID)
 	time.Sleep(3 * time.Second)
 
 	// 检查是否已经跳转到验证码页面（更精确的判断）
@@ -1404,27 +1397,15 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	if alreadyOnVerificationPage != nil {
 		isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
 		isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
-		hasCodeInput := alreadyOnVerificationPage.Value.Get("hasCodeInput").Bool()
-		hasVerifyText := alreadyOnVerificationPage.Value.Get("hasVerifyText").Bool()
-		pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
-
-		log.Printf("🔍 [注册 %d] 页面状态检查:", threadID)
-		log.Printf("   • 有验证码输入框: %v", hasCodeInput)
-		log.Printf("   • 有验证相关文本: %v", hasVerifyText)
-		log.Printf("   • 是验证码页面: %v", isVerificationPage)
-		log.Printf("   • 是姓名页面: %v", isNamePage)
-		log.Printf("   • 页面文本预览: %s...", pagePreview)
 
 		if isVerificationPage || isNamePage {
-			log.Printf("✅ [注册 %d] 页面已自动跳转到下一步", threadID)
+			log.Printf("✅ [注册 %d] 邮箱提交成功，进入下一步", threadID)
 			goto afterEmailSubmit
 		}
 	}
 
 	// 策略2: 按 Enter 键提交
-	log.Printf("⌨️ [注册 %d] 策略2: 尝试按 Enter 键提交", threadID)
 	page.Keyboard.Press(input.Enter)
-	log.Printf("⏳ [注册 %d] 等待 3 秒观察页面响应...", threadID)
 	time.Sleep(3 * time.Second)
 
 	// 再次检查是否跳转（使用同样的精确判断）
@@ -1458,26 +1439,16 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	if alreadyOnVerificationPage != nil {
 		isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
 		isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
-		hasCodeInput := alreadyOnVerificationPage.Value.Get("hasCodeInput").Bool()
-		pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
-
-		log.Printf("🔍 [注册 %d] Enter后页面状态:", threadID)
-		log.Printf("   • 有验证码输入框: %v", hasCodeInput)
-		log.Printf("   • 是验证码页面: %v", isVerificationPage)
-		log.Printf("   • 是姓名页面: %v", isNamePage)
-		log.Printf("   • 页面文本: %s...", pagePreview)
 
 		if isVerificationPage || isNamePage {
-			log.Printf("✅ [注册 %d] Enter 键提交成功，页面已跳转", threadID)
+			log.Printf("✅ [注册 %d] 邮箱提交成功，进入下一步", threadID)
 			goto afterEmailSubmit
 		}
 	}
 
 	// 策略3: 尝试查找并点击按钮（兜底）
-	log.Printf("🔍 [注册 %d] 策略3: 查找并点击提交按钮", threadID)
 	emailSubmitted = false
 	for i := 0; i < 5; i++ {
-		log.Printf("   🔎 [注册 %d] 第 %d/5 次尝试查找按钮...", threadID, i+1)
 		clickResult, _ := page.Eval(`() => {
 			if (!document.body) return { clicked: false, reason: 'body_null' };
 			
@@ -1511,16 +1482,10 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if clickResult != nil {
 			clicked := clickResult.Value.Get("clicked").Bool()
 
-			// 打印找到的所有按钮（gson.JSON 没有 Exists，使用 Nil 判断）
-			if allButtonsVal := clickResult.Value.Get("allButtons"); !allButtonsVal.Nil() {
-				log.Printf("   📋 [注册 %d] 页面可见按钮: %v", threadID, allButtonsVal)
-			}
-
 			if clicked {
 				buttonText := clickResult.Value.Get("text").String()
 				emailSubmitted = true
-				log.Printf("✅ [注册 %d] 找到并点击了提交按钮: '%s'", threadID, buttonText)
-				log.Printf("⏳ [注册 %d] 等待 3 秒观察页面响应...", threadID)
+				log.Printf("✅ [注册 %d] 找到并点击提交按钮: '%s'", threadID, buttonText)
 				time.Sleep(3 * time.Second)
 				break
 			}
@@ -1530,7 +1495,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 
 	// 策略4: 即使没找到按钮，也检查页面状态，不要立即报错
 	if !emailSubmitted {
-		log.Printf("⚠️ [注册 %d] 未找到提交按钮，进行最后检查...", threadID)
 		time.Sleep(2 * time.Second)
 
 		// 获取当前页面URL和详细状态
@@ -1538,7 +1502,6 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		currentURL := ""
 		if info != nil {
 			currentURL = info.URL
-			log.Printf("🌐 [注册 %d] 当前URL: %s", threadID, currentURL)
 		}
 
 		// 最后检查是否在正确页面（使用精确判断）
@@ -1578,26 +1541,18 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if alreadyOnVerificationPage != nil {
 			isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
 			isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
-			pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
-
-			log.Printf("🔍 [注册 %d] 最终页面状态检查:", threadID)
-			log.Printf("   • 是验证码页面: %v", isVerificationPage)
-			log.Printf("   • 是姓名页面: %v", isNamePage)
-			log.Printf("   • 页面文本: %s...", pagePreview)
 
 			if !isVerificationPage && !isNamePage {
 				debugScreenshot(page, threadID, "error_no_submit")
 				result.Error = fmt.Errorf("无法提交邮箱：页面未跳转且找不到提交按钮。当前URL: %s", currentURL)
 				return result
 			}
-			log.Printf("✅ [注册 %d] 页面已在正确状态，继续流程", threadID)
+			log.Printf("✅ [注册 %d] 邮箱提交成功，进入下一步", threadID)
 		}
 	}
 
 afterEmailSubmit:
-	log.Printf("✅ [注册 %d] 邮箱提交流程完成，等待页面稳定...", threadID)
 	time.Sleep(2 * time.Second)
-	debugScreenshot(page, threadID, "04_after_submit")
 
 	// 获取当前URL确认状态
 	info, _ := page.Info()

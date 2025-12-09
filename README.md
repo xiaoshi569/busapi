@@ -94,10 +94,12 @@ cd business2api
 
 # 编译
 go build -o business2api .
+go build -a -o business2api.exe .
 
 # 运行
 ./business2api
 ```
+./business2api.exe --test-imap
 
 ### 方式三：使用 Systemd 服务
 

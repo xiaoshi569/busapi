@@ -38,6 +38,11 @@ var (
 		"SUBMIT": true, "RESEND": true, "CANCEL": true, "DELETE": true, "REMOVE": true,
 		"SEARCH": true, "VIDEOS": true, "IMAGES": true, "GMAIL": true, "EMAIL": true,
 		"ACCOUNT": true, "CHROME": true,
+		// 邮件技术词汇
+		"ESMTPS": true, "ESMTP": true, "SMTP": true, "IMAPS": true, "IMAP": true,
+		"STARTTLS": true, "EHLO": true, "HELO": true, "RCPT": true, "SENDER": true,
+		"HEADER": true, "FOOTER": true, "BORDER": true, "CENTER": true, "BUTTON": true,
+		"MAILTO": true, "DOMAIN": true, "SERVER": true, "CLIENT": true, "HTTPS": true,
 	}
 )
 
@@ -120,7 +125,7 @@ func generateCustomDomainEmail(domain string) string {
 	return prefix + "@" + domain
 }
 
-// isQQImapConfigured 检查是否配置了QQ邮箱IMAP
+// isQQImapConfigured 检查是否配置了IMAP邮箱（支持任何IMAP服务：Gmail, QQ, 163等）
 func isQQImapConfigured() bool {
 	return appConfig.Email.RegisterDomain != "" &&
 		appConfig.Email.QQImap.Address != "" &&
@@ -128,29 +133,37 @@ func isQQImapConfigured() bool {
 }
 
 func getTemporaryEmail() (string, error) {
-	// 优先使用自定义域名（QQ邮箱转发方案）
+	log.Printf("📧 [临时邮箱] 开始获取临时邮箱...")
+
+	// 优先使用自定义域名（IMAP邮箱转发方案）
 	if isQQImapConfigured() {
+		log.Printf("✅ [临时邮箱] 检测到IMAP邮箱配置，使用自定义域名")
 		email := generateCustomDomainEmail(appConfig.Email.RegisterDomain)
-		log.Printf("📧 使用自定义域名邮箱: %s", email)
+		log.Printf("✅ [临时邮箱] 生成自定义域名邮箱: %s (转发到 %s)", email, appConfig.Email.QQImap.Address)
 		return email, nil
 	}
 
 	// 回退到临时邮箱服务
+	log.Printf("🔄 [临时邮箱] 使用临时邮箱服务，共 %d 个提供商", len(tempMailProviders))
 	var lastErr error
-	for _, provider := range tempMailProviders {
+	for i, provider := range tempMailProviders {
+		log.Printf("🔍 [临时邮箱] 尝试提供商 %d/%d: %s", i+1, len(tempMailProviders), provider.Name)
 		email, err := getEmailFromProvider(provider)
 		if err != nil {
 			lastErr = err
-			log.Printf("⚠️ 临时邮箱 %s 失败: %v，尝试下一个", provider.Name, err)
+			log.Printf("❌ [临时邮箱] 提供商 %s 失败: %v，尝试下一个", provider.Name, err)
 			continue
 		}
+		log.Printf("✅ [临时邮箱] 从 %s 获取到邮箱: %s", provider.Name, email)
 		return email, nil
 	}
 
+	log.Printf("❌ [临时邮箱] 所有提供商均失败")
 	return "", fmt.Errorf("所有临时邮箱服务均失败: %v", lastErr)
 }
 
 func getEmailFromProvider(provider TempMailProvider) (string, error) {
+	log.Printf("   🌐 请求 %s API: %s", provider.Name, provider.GenerateURL)
 	req, _ := http.NewRequest("GET", provider.GenerateURL, nil)
 	for k, v := range provider.Headers {
 		req.Header.Set(k, v)
@@ -158,17 +171,21 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		log.Printf("   ❌ HTTP请求失败: %v", err)
 		return "", fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		log.Printf("   ❌ HTTP状态码: %d", resp.StatusCode)
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	body, _ := readResponseBody(resp)
+	log.Printf("   📥 响应大小: %d 字节", len(body))
 	var result TempEmailResponse
 	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("   ❌ JSON解析失败: %v", err)
 		return "", fmt.Errorf("解析响应失败: %w", err)
 	}
 
@@ -177,18 +194,20 @@ func getEmailFromProvider(provider TempMailProvider) (string, error) {
 		email = result.Data.Email
 	}
 	if email == "" {
+		log.Printf("   ❌ 响应中未包含邮箱地址")
 		return "", fmt.Errorf("返回的邮箱为空")
 	}
+	log.Printf("   ✅ 解析到邮箱: %s", email)
 	return email, nil
 }
 
-// ==================== QQ邮箱IMAP读取 ====================
+// ==================== IMAP邮箱读取（支持Gmail/QQ/163等） ====================
 
-// testQQImapConnection 测试QQ邮箱IMAP连接
+// testQQImapConnection 测试IMAP邮箱连接
 func testQQImapConnection() {
 	cfg := appConfig.Email.QQImap
 	if cfg.Address == "" || cfg.AuthCode == "" {
-		log.Println("❌ QQ邮箱IMAP未配置，请在 config.json 中配置 email.qq_imap")
+		log.Println("❌ IMAP邮箱未配置，请在 config.json 中配置 email.qq_imap")
 		return
 	}
 
@@ -201,7 +220,7 @@ func testQQImapConnection() {
 		port = 993
 	}
 
-	log.Println("🔧 测试QQ邮箱IMAP连接...")
+	log.Println("🔧 测试IMAP邮箱连接...")
 	log.Printf("   服务器: %s:%d", server, port)
 	log.Printf("   邮箱: %s", cfg.Address)
 
@@ -303,13 +322,13 @@ func testQQImapConnection() {
 	log.Println("✅ IMAP测试完成")
 }
 
-// getVerificationCodeFromQQMail 从QQ邮箱通过IMAP获取验证码
+// getVerificationCodeFromQQMail 从IMAP邮箱获取验证码（支持Gmail/QQ/163等任何IMAP服务）
 // targetEmail: 注册用的邮箱地址（用于匹配收件人）
 // maxWait: 最大等待时间
 func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (string, error) {
 	cfg := appConfig.Email.QQImap
 	if cfg.Address == "" || cfg.AuthCode == "" {
-		return "", fmt.Errorf("QQ邮箱IMAP未配置")
+		return "", fmt.Errorf("IMAP邮箱未配置")
 	}
 
 	server := cfg.Server
@@ -329,17 +348,17 @@ func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (s
 	// 提取目标邮箱的用户名部分（用于在邮件正文中搜索）
 	targetUser := strings.Split(targetEmail, "@")[0]
 
-	log.Printf("📬 开始从QQ邮箱获取验证码，目标邮箱: %s (用户名: %s), 开始时间: %s UTC",
-		targetEmail, targetUser, startTime.Format("15:04:05"))
+	log.Printf("📬 开始从IMAP邮箱获取验证码，IMAP服务器: %s:%d，监听邮箱: %s，目标注册邮箱: %s (用户名: %s), 开始时间: %s UTC",
+		server, port, cfg.Address, targetEmail, targetUser, startTime.Format("15:04:05"))
 
 	for time.Since(startTime) < maxWait {
 		checkCount++
 		// 传入开始时间，只接受这个时间之后的邮件
 		code, err := checkQQMailForCode(server, port, cfg.Address, cfg.AuthCode, targetEmail, startTime)
 		if err != nil {
-			log.Printf("⚠️ [检查 %d] QQ邮箱检查失败: %v", checkCount, err)
+			log.Printf("⚠️ [检查 %d] IMAP邮箱检查失败: %v", checkCount, err)
 		} else if code != "" {
-			log.Printf("✅ 从QQ邮箱获取到验证码: %s (耗时 %v)", code, time.Since(startTime))
+			log.Printf("✅ 从IMAP邮箱获取到验证码: %s (服务器: %s:%d, 耗时 %v)", code, server, port, time.Since(startTime))
 			return code, nil
 		} else {
 			// 安静模式：不再打印每轮检查日志
@@ -347,14 +366,14 @@ func getVerificationCodeFromQQMail(targetEmail string, maxWait time.Duration) (s
 		time.Sleep(checkInterval)
 	}
 
-	return "", fmt.Errorf("等待验证码超时 (%v)，请检查：1.QQ邮箱是否收到Google邮件 2.邮件转发是否正常", maxWait)
+	return "", fmt.Errorf("等待验证码超时 (%v)，请检查：1.IMAP邮箱(%s)是否收到Google邮件 2.邮件转发是否正常", maxWait, cfg.Address)
 }
 
-// checkQQMailForCode 检查QQ邮箱中的验证码邮件
+// checkQQMailForCode 检查IMAP邮箱中的验证码邮件
 // startTime: 只接受这个时间之后收到的邮件
 func checkQQMailForCode(server string, port int, email, authCode, targetEmail string, startTime time.Time) (string, error) {
-	// 控制邮件调试日志量，false 时仅在命中/结果时输出
-	const verboseEmailLog = false
+	// 控制邮件调试日志量，true 时输出详细调试信息
+	const verboseEmailLog = true
 
 	// 连接IMAP服务器
 	addr := fmt.Sprintf("%s:%d", server, port)
@@ -380,9 +399,9 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		return "", fmt.Errorf("选择收件箱失败: %w", err)
 	}
 
-		if verboseEmailLog {
-			log.Printf("📬 收件箱共 %d 封邮件 (最近: %d, 未读: %d)", mbox.Messages, mbox.Recent, mbox.Unseen)
-		}
+	if verboseEmailLog {
+		log.Printf("📬 收件箱共 %d 封邮件 (最近: %d, 未读: %d)", mbox.Messages, mbox.Recent, mbox.Unseen)
+	}
 
 	if mbox.Messages == 0 {
 		return "", nil // 没有邮件
@@ -407,7 +426,7 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 	section := &imap.BodySectionName{}
 	headerSection := &imap.BodySectionName{Peek: true}
 	headerSection.Specifier = imap.HeaderSpecifier
-	
+
 	items := []imap.FetchItem{
 		section.FetchItem(),
 		imap.FetchEnvelope,
@@ -463,7 +482,7 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 		if headerReader != nil {
 			headerBytes, _ := io.ReadAll(headerReader)
 			headerStr := string(headerBytes)
-			
+
 			// 查找可能包含原始收件人的字段
 			for _, line := range strings.Split(headerStr, "\n") {
 				line = strings.TrimSpace(line)
@@ -542,7 +561,7 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 				break
 			}
 		}
-		
+
 		// 检查正文是否包含目标邮箱地址或用户名
 		bodyContainsTarget := strings.Contains(bodyStr, targetEmail) || strings.Contains(bodyStr, targetUser)
 
@@ -559,6 +578,9 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 
 		// 从邮件内容中提取验证码
 		code, err := extractVerificationCode(bodyStr)
+		if verboseEmailLog {
+			log.Printf("   🔍 验证码提取结果: code='%s', err=%v", code, err)
+		}
 		if err == nil && code != "" {
 			if targetMatched {
 				log.Printf("✅ 从邮件正文提取到验证码: %s (收件人命中)", code)
@@ -569,6 +591,8 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 				fallbackCode = code
 				log.Printf("✅ 从正文兜底提取验证码（收件人未命中）: %s", code)
 			}
+		} else if verboseEmailLog {
+			log.Printf("   ⚠️ 未能从正文提取验证码")
 		}
 
 		// 也尝试从主题中提取
@@ -584,13 +608,21 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 			}
 		}
 
-		// 打印正文前200字符用于调试
+		// 打印正文前500字符用于调试
 		preview := bodyStr
-		if len(preview) > 300 {
-			preview = preview[:300]
+		if len(preview) > 500 {
+			preview = preview[:500]
 		}
 		if verboseEmailLog {
-			log.Printf("   正文预览: %s...", strings.ReplaceAll(preview, "\n", " "))
+			log.Printf("   📄 邮件正文预览(前500字符):\n%s\n   ---", preview)
+
+			// 解码后的内容
+			decoded := decodeMimeContent(bodyStr)
+			decodedPreview := decoded
+			if len(decodedPreview) > 500 {
+				decodedPreview = decodedPreview[:500]
+			}
+			log.Printf("   📝 解码后内容预览(前500字符):\n%s\n   ---", decodedPreview)
 		}
 	}
 
@@ -612,7 +644,7 @@ func checkQQMailForCode(server string, port int, email, authCode, targetEmail st
 
 // getEmailCount 获取当前邮件数量
 func getEmailCount(email string) int {
-	// 如果使用QQ邮箱，不需要计数
+	// 如果使用IMAP邮箱，不需要计数
 	if isQQImapConfigured() {
 		return 0
 	}
@@ -636,9 +668,9 @@ func getEmailCount(email string) int {
 }
 
 // getVerificationCode 统一的验证码获取函数
-// 优先使用QQ邮箱IMAP，回退到临时邮箱API
+// 优先使用IMAP邮箱（Gmail/QQ/163等），回退到临时邮箱API
 func getVerificationCode(targetEmail string, maxWait time.Duration) (string, error) {
-	// 优先使用QQ邮箱IMAP
+	// 优先使用IMAP邮箱
 	if isQQImapConfigured() {
 		return getVerificationCodeFromQQMail(targetEmail, maxWait)
 	}
@@ -696,39 +728,53 @@ func getVerificationEmailAfter(email string, retries int, intervalSec int, initi
 }
 
 func extractVerificationCode(content string) (string, error) {
+	log.Printf("🔍 [验证码提取] 开始提取验证码，内容长度: %d 字节", len(content))
+
 	// 先尝试解析 MIME 内容
 	decodedContent := decodeMimeContent(content)
+	if len(decodedContent) != len(content) {
+		log.Printf("   📝 MIME解码后长度: %d 字节", len(decodedContent))
+	}
 
 	// 0) 关键词附近优先提取（常见“验证码/verification code/one-time code”）
 	// 仅允许关键词后最多40个非数字字符，取到第一段即返回，避免抓到正文其它ID
+	log.Printf("   🔍 策略1: 关键词附近提取...")
 	reKeyword := regexp.MustCompile(`(?i)(?:验证码|verification code|one[-\\s]?time code|one[-\\s]?time password|otp|code)\\D{0,40}([A-Z0-9]{6})`)
 	if m := reKeyword.FindStringSubmatch(decodedContent); len(m) > 1 {
+		log.Printf("   ✅ 通过关键词匹配找到验证码: %s", m[1])
 		return m[1], nil
 	}
 
 	// Google 验证码格式通常是: G-XXXXXX 或纯6位字母数字
 	// 优先匹配 G- 开头的格式
+	log.Printf("   🔍 策略2: Google格式 (G-XXXXXX)...")
 	reGoogle := regexp.MustCompile(`G-([A-Z0-9]{6})`)
 	if m := reGoogle.FindStringSubmatch(decodedContent); len(m) > 1 {
+		log.Printf("   ✅ 通过Google格式找到验证码: %s", m[1])
 		return m[1], nil
 	}
 
 	// 匹配6位大写字母数字组合
+	log.Printf("   🔍 策略3: 通用6位字符匹配...")
 	re := regexp.MustCompile(`\b([A-Z0-9]{6})\b`)
 	matches := re.FindAllStringSubmatch(decodedContent, -1)
+	log.Printf("   📊 找到 %d 个6位字符候选", len(matches))
 
 	hasLetterRe := regexp.MustCompile(`[A-Z]`)
 	hasDigitRe := regexp.MustCompile(`[0-9]`)
 	pureLetterRe := regexp.MustCompile(`^[A-Z]{6}$`)
-	for _, match := range matches {
+	for i, match := range matches {
 		code := match[1]
+		log.Printf("   🔎 候选 %d: %s", i+1, code)
 		if commonWords[code] {
+			log.Printf("      ⏭️ 跳过常见词: %s", code)
 			continue
 		}
 		hasLetter := hasLetterRe.MatchString(code)
 		hasDigit := hasDigitRe.MatchString(code)
 		// 先取字母数字混合（最常见也最可靠）
 		if hasLetter && hasDigit {
+			log.Printf("   ✅ 找到字母数字混合验证码: %s", code)
 			return code, nil
 		}
 		// 再取纯字母（已过滤常见无效词/全相同）
@@ -766,11 +812,14 @@ func extractVerificationCode(content string) (string, error) {
 	}
 
 	// 最后尝试从 "code is" 或 "验证码" 附近提取
+	log.Printf("   🔍 策略4: \"code is\" 模式...")
 	re2 := regexp.MustCompile(`(?i)(?:code|验证码)\s*[:is：]\s*([A-Z0-9]{6})`)
 	if m := re2.FindStringSubmatch(decodedContent); len(m) > 1 {
+		log.Printf("   ✅ 通过 \"code is\" 模式找到验证码: %s", m[1])
 		return m[1], nil
 	}
 
+	log.Printf("   ❌ 所有策略均未找到验证码")
 	return "", fmt.Errorf("无法从邮件中提取验证码")
 }
 
@@ -778,7 +827,68 @@ func extractVerificationCode(content string) (string, error) {
 func decodeMimeContent(content string) string {
 	result := content
 
-	// 尝试解码 Base64 内容
+	// 处理 multipart 邮件，提取所有部分
+	if strings.Contains(strings.ToLower(content), "content-type: multipart") {
+		parts := strings.Split(content, "\n")
+		var extracted strings.Builder
+
+		for i := 0; i < len(parts); i++ {
+			line := parts[i]
+
+			// 检测到 Content-Transfer-Encoding
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "content-transfer-encoding:") {
+				encoding := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.ToLower(line), "content-transfer-encoding:")))
+
+				// 跳过头部，找到实际内容
+				i++
+				for i < len(parts) && strings.TrimSpace(parts[i]) != "" {
+					i++
+				}
+				if i >= len(parts) {
+					break
+				}
+				i++ // 跳过空行
+
+				// 收集内容直到下一个边界或结尾
+				var contentBuilder strings.Builder
+				for i < len(parts) {
+					if strings.HasPrefix(parts[i], "--") ||
+						strings.HasPrefix(strings.ToLower(strings.TrimSpace(parts[i])), "content-") {
+						break
+					}
+					contentBuilder.WriteString(parts[i] + "\n")
+					i++
+				}
+
+				partContent := contentBuilder.String()
+
+				// 根据编码解码
+				if strings.Contains(encoding, "base64") {
+					// 清理内容，移除空格和换行
+					cleaned := strings.ReplaceAll(partContent, "\n", "")
+					cleaned = strings.ReplaceAll(cleaned, "\r", "")
+					cleaned = strings.TrimSpace(cleaned)
+					if decoded, err := base64.StdEncoding.DecodeString(cleaned); err == nil {
+						extracted.WriteString(string(decoded) + "\n")
+					}
+				} else if strings.Contains(encoding, "quoted-printable") {
+					reader := quotedprintable.NewReader(strings.NewReader(partContent))
+					if decoded, err := io.ReadAll(reader); err == nil {
+						extracted.WriteString(string(decoded) + "\n")
+					}
+				} else {
+					extracted.WriteString(partContent + "\n")
+				}
+				i--
+			}
+		}
+
+		if extracted.Len() > 0 {
+			result = extracted.String()
+		}
+	}
+
+	// 尝试解码 Base64 内容（单部分邮件）
 	if strings.Contains(content, "Content-Transfer-Encoding: base64") ||
 		strings.Contains(content, "content-transfer-encoding: base64") {
 		// 查找 Base64 编码的部分
@@ -807,7 +917,7 @@ func decodeMimeContent(content string) string {
 		}
 	}
 
-	// 尝试解码 Quoted-Printable 内容
+	// 尝试解码 Quoted-Printable 内容（单部分邮件）
 	if strings.Contains(content, "Content-Transfer-Encoding: quoted-printable") ||
 		strings.Contains(content, "content-transfer-encoding: quoted-printable") {
 		// 查找并解码 QP 内容
@@ -903,9 +1013,9 @@ func debugScreenshot(page *rod.Page, threadID int, step string) {
 // handleAdditionalSteps 处理额外步骤（复选框等）
 func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 	log.Printf("[注册 %d] 检查是否需要处理额外步骤...", threadID)
-	
+
 	hasAdditionalSteps := false
-	
+
 	// 检查是否需要同意条款（主要处理复选框）
 	checkboxResult, _ := page.Eval(`() => {
 		const checkboxes = document.querySelectorAll('input[type="checkbox"]');
@@ -917,17 +1027,17 @@ func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 		}
 		return { clicked: false };
 	}`)
-	
+
 	if checkboxResult != nil && checkboxResult.Value.Get("clicked").Bool() {
 		hasAdditionalSteps = true
 		log.Printf("[注册 %d] 已勾选条款复选框", threadID)
 		time.Sleep(1 * time.Second)
 	}
-	
+
 	// 如果有额外步骤，尝试提交
 	if hasAdditionalSteps {
 		log.Printf("[注册 %d] 发现有额外步骤，尝试提交...", threadID)
-		
+
 		// 尝试提交额外信息
 		for i := 0; i < 3; i++ {
 			submitResult, _ := page.Eval(`() => {
@@ -958,20 +1068,20 @@ func handleAdditionalSteps(page *rod.Page, threadID int) bool {
 				
 				return { clicked: false };
 			}`)
-			
+
 			if submitResult != nil && submitResult.Value.Get("clicked").Bool() {
 				log.Printf("[注册 %d] 已提交额外信息", threadID)
 				break
 			}
-			
+
 			time.Sleep(1 * time.Second)
 		}
-		
+
 		// 等待可能的跳转
 		time.Sleep(3 * time.Second)
 		return true
 	}
-	
+
 	return false
 }
 
@@ -982,11 +1092,11 @@ func checkAndHandleAdminPage(page *rod.Page, threadID int) bool {
 	if info != nil {
 		currentURL = info.URL
 	}
-	
+
 	// 检查是否是管理创建页面
 	if strings.Contains(currentURL, "/admin/create") {
 		log.Printf("[注册 %d] 检测到管理创建页面，尝试完成设置...", threadID)
-		
+
 		// 尝试查找并点击继续按钮
 		formCompleted, _ := page.Eval(`() => {
 			let completed = false;
@@ -1022,18 +1132,21 @@ func checkAndHandleAdminPage(page *rod.Page, threadID int) bool {
 			
 			return completed;
 		}`)
-		
+
 		if formCompleted != nil && formCompleted.Value.Bool() {
 			log.Printf("[注册 %d] 已处理管理表单，等待跳转...", threadID)
 			time.Sleep(5 * time.Second)
 			return true
 		}
 	}
-	
+
 	return false
 }
 
 func RunBrowserRegister(headless bool, proxy string, threadID int) (result *BrowserRegisterResult) {
+	log.Printf("🎬 [注册 %d] ========== 开始注册流程 ==========", threadID)
+	log.Printf("📋 [注册 %d] 配置: headless=%v, proxy=%s", threadID, headless, proxy)
+
 	result = &BrowserRegisterResult{}
 	defer func() {
 		if r := recover(); r != nil {
@@ -1043,17 +1156,22 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}()
 
 	// 获取临时邮箱
+	log.Printf("📧 [注册 %d] 步骤 1/8: 获取临时邮箱...", threadID)
 	email, err := getTemporaryEmail()
 	if err != nil {
+		log.Printf("❌ [注册 %d] 获取临时邮箱失败: %v", threadID, err)
 		result.Error = err
 		return result
 	}
 	result.Email = email
+	log.Printf("✅ [注册 %d] 获取到邮箱: %s", threadID, email)
 
 	// 启动浏览器 - 优先使用系统浏览器
+	log.Printf("🌐 [注册 %d] 步骤 2/8: 启动浏览器...", threadID)
 	l := launcher.New()
 
 	// 检测系统浏览器（支持更多环境）
+	log.Printf("🔍 [注册 %d] 检测系统浏览器...", threadID)
 	systemBrowsers := []string{
 		// Linux
 		"/usr/bin/google-chrome",
@@ -1078,16 +1196,17 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if _, err := os.Stat(path); err == nil {
 			l = l.Bin(path)
 			browserFound = true
-			log.Printf("[注册 %d] 使用浏览器: %s", threadID, path)
+			log.Printf("✅ [注册 %d] 使用浏览器: %s", threadID, path)
 			break
 		}
 	}
 
 	if !browserFound {
-		log.Printf("[注册 %d] ⚠️ 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
+		log.Printf("⚠️ [注册 %d] 未找到系统浏览器，尝试使用 rod 自动下载", threadID)
 	}
 
 	// 设置启动参数（兼容更多环境 + 增强反检测）
+	log.Printf("⚙️ [注册 %d] 配置浏览器启动参数 (headless=%v)...", threadID, headless)
 	l = l.Headless(headless).
 		Set("no-sandbox").
 		Set("disable-setuid-sandbox").
@@ -1103,9 +1222,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 	if proxy != "" {
+		log.Printf("🔀 [注册 %d] 使用代理: %s", threadID, proxy)
 		l = l.Proxy(proxy)
 	}
 
+	log.Printf("🚀 [注册 %d] 启动浏览器实例...", threadID)
 	url, err := l.Launch()
 	if err != nil {
 		result.Error = fmt.Errorf("启动浏览器失败: %w", err)
@@ -1188,20 +1309,29 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			csesidx = m[1]
 		}
 	})()
+	log.Printf("🌍 [注册 %d] 步骤 3/8: 打开注册页面...", threadID)
 	if err := page.Navigate("https://business.gemini.google"); err != nil {
+		log.Printf("❌ [注册 %d] 打开页面失败: %v", threadID, err)
 		result.Error = fmt.Errorf("打开页面失败: %w", err)
 		return result
 	}
 	page.WaitLoad()
+	log.Printf("✅ [注册 %d] 页面加载完成", threadID)
 	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "01_page_loaded")
+
+	log.Printf("⏳ [注册 %d] 等待输入框出现（最多20秒）...", threadID)
 	if _, err := page.Timeout(20 * time.Second).Element("input"); err != nil {
+		log.Printf("❌ [注册 %d] 等待输入框超时: %v", threadID, err)
 		result.Error = fmt.Errorf("等待输入框超时: %w", err)
 		return result
 	}
+	log.Printf("✅ [注册 %d] 输入框已出现", threadID)
 	time.Sleep(300 * time.Millisecond)
 
 	// 点击输入框聚焦
+	log.Printf("✍️ [注册 %d] 步骤 4/8: 输入邮箱地址...", threadID)
+	log.Printf("📝 [注册 %d] 邮箱: %s", threadID, email)
 	page.Eval(`() => {
 		const inputs = document.querySelectorAll('input');
 		if (inputs.length > 0) {
@@ -1210,7 +1340,9 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 	}`)
 	time.Sleep(200 * time.Millisecond)
+	log.Printf("⌨️ [注册 %d] 开始输入邮箱（每个字符延迟15ms）...", threadID)
 	safeType(page, email, 15)
+	log.Printf("✅ [注册 %d] 邮箱输入完成", threadID)
 	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "02_email_input")
 
@@ -1223,57 +1355,133 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	}`)
 	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "03_before_submit")
-	
+
 	log.Printf("[注册 %d] 等待页面自动跳转或准备提交...", threadID)
-	
+
 	// 提前声明变量（避免 goto 跳过声明）
 	var emailSubmitted bool
 	var alreadyOnVerificationPage *proto.RuntimeRemoteObject
-	
+
 	// 策略1: 先等待3秒，检查是否自动跳转
+	log.Printf("⏳ [注册 %d] 等待 3 秒，观察页面是否自动跳转...", threadID)
 	time.Sleep(3 * time.Second)
-	
-	// 检查是否已经跳转到验证码页面
+
+	// 检查是否已经跳转到验证码页面（更精确的判断）
 	alreadyOnVerificationPage, _ = page.Eval(`() => {
+		// 检查是否有验证码输入框（更可靠的判断）
+		const inputs = document.querySelectorAll('input');
+		let hasCodeInput = false;
+		for (const input of inputs) {
+			const placeholder = (input.placeholder || '').toLowerCase();
+			const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
+			if (placeholder.includes('code') || placeholder.includes('验证码') || 
+			    ariaLabel.includes('code') || ariaLabel.includes('verification')) {
+				hasCodeInput = true;
+				break;
+			}
+		}
+		
+		// 检查页面文本（更严格的条件）
 		const pageText = document.body ? document.body.textContent : '';
-		return pageText.includes('验证') || pageText.includes('Verify') || 
-		       pageText.includes('code') || pageText.includes('sent') ||
-		       pageText.includes('姓氏') || pageText.includes('名字') || 
-		       pageText.includes('Full name') || pageText.includes('全名');
+		const hasVerifyText = pageText.includes('验证码') || 
+		                      pageText.includes('verification code') ||
+		                      pageText.includes('Enter the code') ||
+		                      pageText.includes('输入验证码');
+		const hasNameText = pageText.includes('姓氏') || pageText.includes('名字') || 
+		                    pageText.includes('Full name') || pageText.includes('全名') ||
+		                    pageText.includes('First name') || pageText.includes('Last name');
+		
+		return {
+			hasCodeInput: hasCodeInput,
+			hasVerifyText: hasVerifyText,
+			hasNameText: hasNameText,
+			isVerificationPage: hasCodeInput || hasVerifyText,
+			isNamePage: hasNameText,
+			pageTextPreview: pageText.substring(0, 200)
+		};
 	}`)
-	
-	if alreadyOnVerificationPage != nil && alreadyOnVerificationPage.Value.Bool() {
-		log.Printf("[注册 %d] ✅ 页面已自动跳转", threadID)
-		goto afterEmailSubmit
+
+	if alreadyOnVerificationPage != nil {
+		isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
+		isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
+		hasCodeInput := alreadyOnVerificationPage.Value.Get("hasCodeInput").Bool()
+		hasVerifyText := alreadyOnVerificationPage.Value.Get("hasVerifyText").Bool()
+		pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
+
+		log.Printf("🔍 [注册 %d] 页面状态检查:", threadID)
+		log.Printf("   • 有验证码输入框: %v", hasCodeInput)
+		log.Printf("   • 有验证相关文本: %v", hasVerifyText)
+		log.Printf("   • 是验证码页面: %v", isVerificationPage)
+		log.Printf("   • 是姓名页面: %v", isNamePage)
+		log.Printf("   • 页面文本预览: %s...", pagePreview)
+
+		if isVerificationPage || isNamePage {
+			log.Printf("✅ [注册 %d] 页面已自动跳转到下一步", threadID)
+			goto afterEmailSubmit
+		}
 	}
-	
+
 	// 策略2: 按 Enter 键提交
-	log.Printf("[注册 %d] 尝试按 Enter 键提交", threadID)
+	log.Printf("⌨️ [注册 %d] 策略2: 尝试按 Enter 键提交", threadID)
 	page.Keyboard.Press(input.Enter)
-	time.Sleep(2 * time.Second)
-	
-	// 再次检查是否跳转
+	log.Printf("⏳ [注册 %d] 等待 3 秒观察页面响应...", threadID)
+	time.Sleep(3 * time.Second)
+
+	// 再次检查是否跳转（使用同样的精确判断）
 	alreadyOnVerificationPage, _ = page.Eval(`() => {
+		const inputs = document.querySelectorAll('input');
+		let hasCodeInput = false;
+		for (const input of inputs) {
+			const placeholder = (input.placeholder || '').toLowerCase();
+			const ariaLabel = (input.getAttribute('aria-label') || '').toLowerCase();
+			if (placeholder.includes('code') || placeholder.includes('验证码') || 
+			    ariaLabel.includes('code') || ariaLabel.includes('verification')) {
+				hasCodeInput = true;
+				break;
+			}
+		}
+		
 		const pageText = document.body ? document.body.textContent : '';
-		return pageText.includes('验证') || pageText.includes('Verify') || 
-		       pageText.includes('code') || pageText.includes('sent') ||
-		       pageText.includes('姓氏') || pageText.includes('名字') || 
-		       pageText.includes('Full name') || pageText.includes('全名');
+		const hasVerifyText = pageText.includes('验证码') || 
+		                      pageText.includes('verification code') ||
+		                      pageText.includes('Enter the code');
+		const hasNameText = pageText.includes('姓氏') || pageText.includes('Full name') || pageText.includes('全名');
+		
+		return {
+			isVerificationPage: hasCodeInput || hasVerifyText,
+			isNamePage: hasNameText,
+			hasCodeInput: hasCodeInput,
+			pageTextPreview: pageText.substring(0, 200)
+		};
 	}`)
-	
-	if alreadyOnVerificationPage != nil && alreadyOnVerificationPage.Value.Bool() {
-		log.Printf("[注册 %d] ✅ Enter 键提交成功", threadID)
-		goto afterEmailSubmit
+
+	if alreadyOnVerificationPage != nil {
+		isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
+		isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
+		hasCodeInput := alreadyOnVerificationPage.Value.Get("hasCodeInput").Bool()
+		pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
+
+		log.Printf("🔍 [注册 %d] Enter后页面状态:", threadID)
+		log.Printf("   • 有验证码输入框: %v", hasCodeInput)
+		log.Printf("   • 是验证码页面: %v", isVerificationPage)
+		log.Printf("   • 是姓名页面: %v", isNamePage)
+		log.Printf("   • 页面文本: %s...", pagePreview)
+
+		if isVerificationPage || isNamePage {
+			log.Printf("✅ [注册 %d] Enter 键提交成功，页面已跳转", threadID)
+			goto afterEmailSubmit
+		}
 	}
-	
+
 	// 策略3: 尝试查找并点击按钮（兜底）
-	log.Printf("[注册 %d] 尝试查找提交按钮", threadID)
+	log.Printf("🔍 [注册 %d] 策略3: 查找并点击提交按钮", threadID)
 	emailSubmitted = false
 	for i := 0; i < 5; i++ {
+		log.Printf("   🔎 [注册 %d] 第 %d/5 次尝试查找按钮...", threadID, i+1)
 		clickResult, _ := page.Eval(`() => {
 			if (!document.body) return { clicked: false, reason: 'body_null' };
 			
-			const targets = ['继续', 'Next', '邮箱', 'Continue'];
+			const targets = ['继续', 'Next', '邮箱', 'Continue', 'Submit'];
 			const elements = [
 				...document.querySelectorAll('button'),
 				...document.querySelectorAll('input[type="submit"]'),
@@ -1281,53 +1489,122 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				...document.querySelectorAll('span[role="button"]')
 			];
 
+			// 记录所有可见按钮用于调试
+			let visibleButtons = [];
 			for (const element of elements) {
 				if (!element) continue;
 				const style = window.getComputedStyle(element);
 				if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
 				if (element.disabled) continue;
-
+				
 				const text = element.textContent ? element.textContent.trim() : '';
+				visibleButtons.push(text);
+				
 				if (targets.some(t => text.includes(t))) {
 					element.click();
-					return { clicked: true, text: text };
+					return { clicked: true, text: text, allButtons: visibleButtons };
 				}
 			}
-			return { clicked: false, reason: 'no_button' };
+			return { clicked: false, reason: 'no_button', allButtons: visibleButtons };
 		}`)
 
-		if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
-			emailSubmitted = true
-			log.Printf("[注册 %d] ✅ 找到并点击了提交按钮", threadID)
-			break
+		if clickResult != nil {
+			clicked := clickResult.Value.Get("clicked").Bool()
+
+			// 打印找到的所有按钮（gson.JSON 没有 Exists，使用 Nil 判断）
+			if allButtonsVal := clickResult.Value.Get("allButtons"); !allButtonsVal.Nil() {
+				log.Printf("   📋 [注册 %d] 页面可见按钮: %v", threadID, allButtonsVal)
+			}
+
+			if clicked {
+				buttonText := clickResult.Value.Get("text").String()
+				emailSubmitted = true
+				log.Printf("✅ [注册 %d] 找到并点击了提交按钮: '%s'", threadID, buttonText)
+				log.Printf("⏳ [注册 %d] 等待 3 秒观察页面响应...", threadID)
+				time.Sleep(3 * time.Second)
+				break
+			}
 		}
 		time.Sleep(1 * time.Second)
 	}
-	
+
 	// 策略4: 即使没找到按钮，也检查页面状态，不要立即报错
 	if !emailSubmitted {
-		log.Printf("[注册 %d] ⚠️ 未找到提交按钮，检查页面状态...", threadID)
+		log.Printf("⚠️ [注册 %d] 未找到提交按钮，进行最后检查...", threadID)
 		time.Sleep(2 * time.Second)
-		
-		// 最后检查是否在正确页面
-		alreadyOnVerificationPage, _ = page.Eval(`() => {
-			const pageText = document.body ? document.body.textContent : '';
-			return pageText.includes('验证') || pageText.includes('Verify') || 
-			       pageText.includes('code') || pageText.includes('sent') ||
-			       pageText.includes('姓氏') || pageText.includes('名字') || 
-			       pageText.includes('Full name') || pageText.includes('全名');
-		}`)
-		
-		if alreadyOnVerificationPage == nil || !alreadyOnVerificationPage.Value.Bool() {
-			result.Error = fmt.Errorf("无法提交邮箱：页面未跳转且找不到提交按钮")
-			return result
+
+		// 获取当前页面URL和详细状态
+		info, _ := page.Info()
+		currentURL := ""
+		if info != nil {
+			currentURL = info.URL
+			log.Printf("🌐 [注册 %d] 当前URL: %s", threadID, currentURL)
 		}
-		log.Printf("[注册 %d] ✅ 页面已在正确状态，继续流程", threadID)
+
+		// 最后检查是否在正确页面（使用精确判断）
+		alreadyOnVerificationPage, _ = page.Eval(`() => {
+			const inputs = document.querySelectorAll('input');
+			let hasCodeInput = false;
+			let inputDetails = [];
+			for (const input of inputs) {
+				const placeholder = input.placeholder || '';
+				const type = input.type || '';
+				const ariaLabel = input.getAttribute('aria-label') || '';
+				inputDetails.push({ type, placeholder, ariaLabel });
+				
+				if (placeholder.toLowerCase().includes('code') || 
+				    placeholder.includes('验证码') || 
+				    ariaLabel.toLowerCase().includes('code') ||
+				    ariaLabel.toLowerCase().includes('verification')) {
+					hasCodeInput = true;
+				}
+			}
+			
+			const pageText = document.body ? document.body.textContent : '';
+			const hasVerifyText = pageText.includes('验证码') || 
+			                      pageText.includes('verification code') ||
+			                      pageText.includes('Enter the code');
+			const hasNameText = pageText.includes('姓氏') || pageText.includes('Full name') || pageText.includes('全名');
+			
+			return {
+				isVerificationPage: hasCodeInput || hasVerifyText,
+				isNamePage: hasNameText,
+				hasCodeInput: hasCodeInput,
+				inputDetails: inputDetails,
+				pageTextPreview: pageText.substring(0, 300)
+			};
+		}`)
+
+		if alreadyOnVerificationPage != nil {
+			isVerificationPage := alreadyOnVerificationPage.Value.Get("isVerificationPage").Bool()
+			isNamePage := alreadyOnVerificationPage.Value.Get("isNamePage").Bool()
+			pagePreview := alreadyOnVerificationPage.Value.Get("pageTextPreview").String()
+
+			log.Printf("🔍 [注册 %d] 最终页面状态检查:", threadID)
+			log.Printf("   • 是验证码页面: %v", isVerificationPage)
+			log.Printf("   • 是姓名页面: %v", isNamePage)
+			log.Printf("   • 页面文本: %s...", pagePreview)
+
+			if !isVerificationPage && !isNamePage {
+				debugScreenshot(page, threadID, "error_no_submit")
+				result.Error = fmt.Errorf("无法提交邮箱：页面未跳转且找不到提交按钮。当前URL: %s", currentURL)
+				return result
+			}
+			log.Printf("✅ [注册 %d] 页面已在正确状态，继续流程", threadID)
+		}
 	}
-	
+
 afterEmailSubmit:
+	log.Printf("✅ [注册 %d] 邮箱提交流程完成，等待页面稳定...", threadID)
 	time.Sleep(2 * time.Second)
 	debugScreenshot(page, threadID, "04_after_submit")
+
+	// 获取当前URL确认状态
+	info, _ := page.Info()
+	if info != nil {
+		log.Printf("🌐 [注册 %d] 提交后URL: %s", threadID, info.URL)
+	}
+
 	var needsVerification bool
 	checkResult, _ := page.Eval(`() => {
 		const pageText = document.body ? document.body.textContent : '';
@@ -1376,16 +1653,19 @@ afterEmailSubmit:
 
 	// 处理验证码
 	if needsVerification {
+		log.Printf("🔐 [注册 %d] 步骤 5/8: 获取验证码...", threadID)
 		maxWaitTime := 3 * time.Minute
 		var code string
 		var codeErr error
 
 		// 使用统一的验证码获取函数
 		if isQQImapConfigured() {
-			// QQ邮箱方案：直接获取验证码
-			log.Printf("[注册 %d] 使用QQ邮箱IMAP获取验证码...", threadID)
+			// IMAP邮箱方案：直接获取验证码
+			log.Printf("📬 [注册 %d] 使用IMAP邮箱获取验证码 (IMAP邮箱: %s, 目标邮箱: %s)...",
+				threadID, appConfig.Email.QQImap.Address, email)
 			code, codeErr = getVerificationCode(email, maxWaitTime)
 		} else {
+			log.Printf("📨 [注册 %d] 使用临时邮箱API获取验证码...", threadID)
 			// 临时邮箱方案：原有逻辑
 			var emailContent *EmailContent
 			startTime := time.Now()
@@ -1424,13 +1704,15 @@ afterEmailSubmit:
 		}
 
 		if codeErr != nil {
+			log.Printf("❌ [注册 %d] 获取验证码失败: %v", threadID, codeErr)
 			result.Error = codeErr
 			return result
 		}
 
-		log.Printf("[注册 %d] 获取到验证码: %s", threadID, code)
+		log.Printf("✅ [注册 %d] 获取到验证码: %s", threadID, code)
 
 		// 等待验证码输入框
+		log.Printf("✍️ [注册 %d] 步骤 6/8: 输入验证码...", threadID)
 		time.Sleep(500 * time.Millisecond)
 
 		// 清空并聚焦输入框
@@ -1443,7 +1725,9 @@ afterEmailSubmit:
 			}
 		}`)
 		time.Sleep(200 * time.Millisecond)
+		log.Printf("⌨️ [注册 %d] 开始输入验证码: %s", threadID, code)
 		safeType(page, code, 15)
+		log.Printf("✅ [注册 %d] 验证码输入完成", threadID)
 		time.Sleep(500 * time.Millisecond)
 
 		// 触发 blur
@@ -1489,8 +1773,10 @@ afterEmailSubmit:
 	}
 
 	// 填写姓名
+	log.Printf("👤 [注册 %d] 步骤 7/8: 填写姓名...", threadID)
 	fullName := generateRandomName()
 	result.FullName = fullName
+	log.Printf("📝 [注册 %d] 生成随机姓名: %s", threadID, fullName)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -1506,7 +1792,9 @@ afterEmailSubmit:
 	time.Sleep(200 * time.Millisecond)
 
 	// 输入姓名
+	log.Printf("⌨️ [注册 %d] 开始输入姓名: %s", threadID, fullName)
 	safeType(page, fullName, 15)
+	log.Printf("✅ [注册 %d] 姓名输入完成", threadID)
 	time.Sleep(500 * time.Millisecond)
 
 	// 触发 blur
@@ -1517,7 +1805,7 @@ afterEmailSubmit:
 		}
 	}`)
 	time.Sleep(200 * time.Millisecond)
-	
+
 	// 确认提交姓名
 	confirmSubmitted := false
 	for i := 0; i < 5; i++ {
@@ -1558,28 +1846,31 @@ afterEmailSubmit:
 		}
 		time.Sleep(1000 * time.Millisecond)
 	}
-	
+
 	if !confirmSubmitted {
 		log.Printf("[注册 %d] ⚠️ 未能点击确认按钮，尝试继续", threadID)
 	}
-	
+
 	time.Sleep(3 * time.Second)
-	
+
 	// 等待页面稳定
 	page.WaitLoad()
 	time.Sleep(2 * time.Second)
-	
+
 	// 处理额外步骤（主要是复选框）
 	handleAdditionalSteps(page, threadID)
-	
+
 	// 检查并处理管理创建页面
 	checkAndHandleAdminPage(page, threadID)
-	
+
 	// 等待更多可能的跳转
 	time.Sleep(3 * time.Second)
-	
+
 	// 尝试多次点击可能出现的额外按钮，并等待获取 Authorization
 	// 增加到 25 次，每次等待 3 秒
+	log.Printf("🔑 [注册 %d] 步骤 8/8: 等待获取 Authorization...", threadID)
+	log.Printf("⏳ [注册 %d] 最多尝试 25 次，每次间隔 3 秒...", threadID)
+
 	for i := 0; i < 25; i++ {
 		time.Sleep(3 * time.Second)
 
@@ -1626,16 +1917,16 @@ afterEmailSubmit:
 			break
 		}
 	}
-	
+
 	// 增强的 Authorization 获取逻辑
 	if authorization == "" {
 		log.Printf("[注册 %d] ⚠️ 仍未获取到 Authorization，尝试主动触发网络请求...", threadID)
-		
+
 		// 尝试导航到主页，触发认证请求
 		page.Navigate("https://business.gemini.google/app")
 		page.WaitLoad()
 		time.Sleep(5 * time.Second)
-		
+
 		// 如果还没有，尝试刷新页面
 		if authorization == "" {
 			log.Printf("[注册 %d] 尝试刷新页面...", threadID)
@@ -1643,7 +1934,7 @@ afterEmailSubmit:
 			page.WaitLoad()
 			time.Sleep(5 * time.Second)
 		}
-		
+
 		// 尝试从 localStorage 获取
 		localStorageAuth, _ := page.Eval(`() => {
 			const auth = localStorage.getItem('Authorization') || 
@@ -1652,7 +1943,7 @@ afterEmailSubmit:
 				   localStorage.getItem('token');
 			return auth || ''; // 确保返回字符串而不是 null
 		}`)
-		
+
 		if localStorageAuth != nil {
 			authStr := localStorageAuth.Value.String()
 			// 过滤掉 nil, null, undefined 等无效值
@@ -1661,7 +1952,7 @@ afterEmailSubmit:
 				log.Printf("[注册 %d] 从 localStorage 获取 Authorization", threadID)
 			}
 		}
-		
+
 		// 从页面源代码中提取
 		pageContent, _ := page.Eval(`() => document.body ? document.body.innerHTML : ''`)
 		if pageContent != nil && pageContent.Value.String() != "" {
@@ -1672,7 +1963,7 @@ afterEmailSubmit:
 				log.Printf("[注册 %d] 从页面内容提取 Authorization", threadID)
 			}
 		}
-		
+
 		// 从当前 URL 中提取
 		info, _ := page.Info()
 		if info != nil {
@@ -1686,9 +1977,13 @@ afterEmailSubmit:
 	}
 
 	if authorization == "" {
+		log.Printf("❌ [注册 %d] 未能获取 Authorization", threadID)
 		result.Error = fmt.Errorf("未能获取 Authorization")
 		return result
 	}
+	log.Printf("✅ [注册 %d] Authorization 获取成功", threadID)
+
+	log.Printf("🍪 [注册 %d] 收集 Cookies...", threadID)
 	var resultCookies []Cookie
 	cookieMap := make(map[string]bool)
 
@@ -1745,13 +2040,32 @@ afterEmailSubmit:
 	result.ConfigID = configID
 	result.CSESIDX = csesidx
 
-	log.Printf("[注册 %d] ✅ 注册成功: %s", threadID, email)
+	log.Printf("🎉 [注册 %d] ========== 注册成功 ==========", threadID)
+	log.Printf("📋 [注册 %d] 账号信息:", threadID)
+	log.Printf("   • 邮箱: %s", email)
+	log.Printf("   • 姓名: %s", fullName)
+	log.Printf("   • ConfigID: %s", configID)
+	log.Printf("   • CSESIDX: %s", csesidx)
+	log.Printf("   • Cookies数量: %d", len(resultCookies))
+	log.Printf("   • Authorization: %s...", authorization[:min(50, len(authorization))])
+
 	return result
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // SaveBrowserRegisterResult 保存注册结果
 func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) error {
+	log.Printf("💾 [保存账号] 开始保存注册结果...")
+	log.Printf("📧 [保存账号] 邮箱: %s", result.Email)
+
 	if !result.Success {
+		log.Printf("❌ [保存账号] 注册未成功，跳过保存")
 		return result.Error
 	}
 
@@ -1765,16 +2079,31 @@ func SaveBrowserRegisterResult(result *BrowserRegisterResult, dataDir string) er
 		Timestamp:     time.Now().Format(time.RFC3339),
 	}
 
+	log.Printf("📋 [保存账号] 账号数据:")
+	log.Printf("   • Email: %s", data.Email)
+	log.Printf("   • FullName: %s", data.FullName)
+	log.Printf("   • ConfigID: %s", data.ConfigID)
+	log.Printf("   • CSESIDX: %s", data.CSESIDX)
+	log.Printf("   • Cookies数量: %d", len(data.Cookies))
+	log.Printf("   • Timestamp: %s", data.Timestamp)
+
+	log.Printf("🔄 [保存账号] 序列化为JSON...")
 	jsonData, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
+		log.Printf("❌ [保存账号] 序列化失败: %v", err)
 		return fmt.Errorf("序列化失败: %w", err)
 	}
+	log.Printf("✅ [保存账号] JSON大小: %d 字节", len(jsonData))
 
 	filename := filepath.Join(dataDir, fmt.Sprintf("%s.json", result.Email))
+	log.Printf("💾 [保存账号] 写入文件: %s", filename)
+
 	if err := os.WriteFile(filename, jsonData, 0644); err != nil {
+		log.Printf("❌ [保存账号] 写入文件失败: %v", err)
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
 
+	log.Printf("✅ [保存账号] 账号保存成功: %s", filename)
 	return nil
 }
 
@@ -2048,12 +2377,12 @@ func RefreshCookieWithBrowser(acc *Account, headless bool, proxy string) *Browse
 		var codeErr error
 		maxWaitTime := 3 * time.Minute
 
-		// 判断是否使用QQ邮箱（检查邮箱域名是否匹配配置的注册域名）
+		// 判断是否使用IMAP邮箱（检查邮箱域名是否匹配配置的注册域名）
 		useQQImap := isQQImapConfigured() && strings.HasSuffix(email, "@"+appConfig.Email.RegisterDomain)
 
 		if useQQImap {
-			// QQ邮箱方案
-			log.Printf("[Cookie刷新] [%s] 使用QQ邮箱IMAP获取验证码...", email)
+			// IMAP邮箱方案
+			log.Printf("[Cookie刷新] [%s] 使用IMAP邮箱获取验证码 (邮箱: %s)...", email, appConfig.Email.QQImap.Address)
 			code, codeErr = getVerificationCode(email, maxWaitTime)
 		} else {
 			// 临时邮箱方案
@@ -2228,43 +2557,57 @@ extractResult:
 
 // NativeRegisterWorker 原生 Go 注册 worker
 func NativeRegisterWorker(id int, dataDirAbs string) {
+	log.Printf("🏁 [注册线程 %d] 线程启动，延迟 %d 秒后开始工作", id, id*3)
 	time.Sleep(time.Duration(id) * 3 * time.Second)
 
+	taskCount := 0
 	for atomic.LoadInt32(&isRegistering) == 1 {
-		if pool.TotalCount() >= appConfig.Pool.TargetCount {
+		currentCount := pool.TotalCount()
+		targetCount := appConfig.Pool.TargetCount
+
+		if currentCount >= targetCount {
+			log.Printf("✅ [注册线程 %d] 已达目标账号数 (%d/%d)，线程退出", id, currentCount, targetCount)
 			return
 		}
 
-		log.Printf("[注册线程 %d] 启动注册任务", id)
+		taskCount++
+		log.Printf("🔨 [注册线程 %d] 开始第 %d 次注册任务 (当前进度: %d/%d)", id, taskCount, currentCount, targetCount)
 
+		startTime := time.Now()
 		result := RunBrowserRegister(appConfig.Pool.RegisterHeadless, Proxy, id)
+		duration := time.Since(startTime)
 
 		if result.Success {
+			log.Printf("💾 [注册线程 %d] 保存注册结果到文件...", id)
 			if err := SaveBrowserRegisterResult(result, dataDirAbs); err != nil {
-				log.Printf("[注册线程 %d] ⚠️ 保存失败: %v", id, err)
+				log.Printf("❌ [注册线程 %d] 保存失败 (耗时 %v): %v", id, duration, err)
 				registerStats.AddFailed(err.Error())
 			} else {
+				log.Printf("✅ [注册线程 %d] 保存成功 (耗时 %v)，重新加载账号池", id, duration)
 				registerStats.AddSuccess()
 				pool.Load(DataDir)
+				log.Printf("📊 [注册线程 %d] 当前账号池: 总数=%d, 就绪=%d, 待刷新=%d",
+					id, pool.TotalCount(), pool.ReadyCount(), pool.PendingCount())
 			}
 		} else {
 			errMsg := "未知错误"
 			if result.Error != nil {
 				errMsg = result.Error.Error()
 			}
-			log.Printf("[注册线程 %d] ❌ 注册失败: %s", id, errMsg)
+			log.Printf("❌ [注册线程 %d] 注册失败 (耗时 %v): %s", id, duration, errMsg)
 			registerStats.AddFailed(errMsg)
 
+			// 根据错误类型决定等待时间
 			if strings.Contains(errMsg, "频繁") || strings.Contains(errMsg, "rate") ||
 				strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "连接") {
 				waitTime := 10 + id*2
-				log.Printf("[注册线程 %d] ⏳ 等待 %d 秒后重试...", id, waitTime)
+				log.Printf("⏳ [注册线程 %d] 检测到限流/超时错误，等待 %d 秒后重试...", id, waitTime)
 				time.Sleep(time.Duration(waitTime) * time.Second)
 			} else {
+				log.Printf("⏳ [注册线程 %d] 等待 3 秒后继续...", id)
 				time.Sleep(3 * time.Second)
 			}
 		}
 	}
-	log.Printf("[注册线程 %d] 停止", id)
+	log.Printf("🛑 [注册线程 %d] 线程停止 (共完成 %d 次注册任务)", id, taskCount)
 }
-
